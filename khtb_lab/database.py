@@ -20,7 +20,23 @@ class Database:
         CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, ts_open TEXT NOT NULL, ts_close TEXT, symbol TEXT NOT NULL, direction TEXT NOT NULL, entry REAL NOT NULL, stop REAL NOT NULL, target REAL NOT NULL, qty REAL NOT NULL, status TEXT NOT NULL, mode TEXT NOT NULL, pnl REAL, r_multiple REAL, source TEXT NOT NULL DEFAULT 'PAPER', close_reason TEXT, snapshot TEXT);
         CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS daily_stats(day TEXT PRIMARY KEY, realized_pnl REAL NOT NULL DEFAULT 0, trades INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_trades_status_symbol ON trades(status, symbol);
         """)
+        self.conn.commit()
+        self._migrate_trades()
+
+    def _migrate_trades(self):
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(trades)").fetchall()}
+        additions = {
+            'exchange_order_id': 'TEXT',
+            'exchange_client_order_id': 'TEXT',
+            'exchange_stop_id': 'TEXT',
+            'exchange_take_profit_id': 'TEXT',
+            'exchange_entry_price': 'REAL',
+        }
+        for name, kind in additions.items():
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {kind}")
         self.conn.commit()
 
     def seed_symbols(self, symbols):
@@ -42,8 +58,8 @@ class Database:
         cur=self.conn.execute("DELETE FROM symbols WHERE symbol=?",(symbol,)); self.conn.commit(); return cur.rowcount>0
     def save_signal(self, symbol, direction, price, score, setup, reason, snapshot):
         cur=self.conn.execute("INSERT INTO signals(ts,symbol,direction,price,score,setup,reason,snapshot) VALUES(?,?,?,?,?,?,?,?)",(datetime.now(timezone.utc).isoformat(),symbol,direction,price,score,setup,reason,json.dumps(snapshot,default=str))); self.conn.commit(); return cur.lastrowid
-    def open_trade(self, symbol, direction, entry, stop, target, qty, mode="MANUAL", source="PAPER", snapshot=None):
-        cur=self.conn.execute("INSERT INTO trades(ts_open,symbol,direction,entry,stop,target,qty,status,mode,source,snapshot) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,?)",(datetime.now(timezone.utc).isoformat(),symbol,direction,entry,stop,target,qty,mode,source,json.dumps(snapshot or {},default=str))); self.conn.commit(); return cur.lastrowid
+    def open_trade(self, symbol, direction, entry, stop, target, qty, mode="MANUAL", source="PAPER", snapshot=None, exchange_order_id=None, exchange_client_order_id=None, exchange_stop_id=None, exchange_take_profit_id=None, exchange_entry_price=None):
+        cur=self.conn.execute("INSERT INTO trades(ts_open,symbol,direction,entry,stop,target,qty,status,mode,source,snapshot,exchange_order_id,exchange_client_order_id,exchange_stop_id,exchange_take_profit_id,exchange_entry_price) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,?)",(datetime.now(timezone.utc).isoformat(),symbol,direction,entry,stop,target,qty,mode,source,json.dumps(snapshot or {},default=str),exchange_order_id,exchange_client_order_id,exchange_stop_id,exchange_take_profit_id,exchange_entry_price)); self.conn.commit(); return cur.lastrowid
     def close_trade(self, trade_id, exit_price, pnl, reason):
         row=self.conn.execute("SELECT entry,stop,direction FROM trades WHERE id=? AND status='OPEN'",(trade_id,)).fetchone()
         if not row: return False
