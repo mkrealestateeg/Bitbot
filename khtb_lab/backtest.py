@@ -2,7 +2,7 @@ from __future__ import annotations
 import pandas as pd
 from .strategy import analyze
 
-def run_backtest(df: pd.DataFrame, trend_df: pd.DataFrame, context_df: pd.DataFrame, risk_reward=2.0, risk_per_trade=0.01):
+def run_backtest(df: pd.DataFrame, trend_df: pd.DataFrame, context_df: pd.DataFrame, risk_reward=2.0, risk_per_trade=0.005):
     """Simple next-bar OHLC backtest. No fees/slippage; results are research-only, not production evidence."""
     if len(df)<220: raise ValueError('Need at least 220 main timeframe candles')
     trades=[]; enriched_start=200

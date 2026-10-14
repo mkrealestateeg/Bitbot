@@ -1,85 +1,69 @@
-# Khtb Lab — Demo Trading Build
+# Khtb Lab — Independent V3 Lab
 
-Khtb Lab is an independent crypto perpetuals research/trading bot. It is separate from the older Khtp project.
+Khtb Lab is a **separate repository-ready** Python project for crypto market analysis, Telegram control, local paper trading, trade journaling, and research backtesting. It does not modify or depend on the existing Khtp repository.
 
-## Current build
+> **Safety status:** This release defaults to `TRADING_ENV=paper`, `TRADING_MODE=MANUAL`, and `ENABLE_EXCHANGE_ORDERS=false`. Paper trades are simulated locally. It reads Bitget public market data through CCXT. It does **not** submit exchange orders in this release, even if demo credentials are supplied. Do not interpret passing unit tests as proof of Bitget demo order protection.
 
-- Bitget USDT perpetual market data through CCXT.
-- 15m entry + 1h trend/levels + 4h context.
-- Deterministic technical engine using EMA20/50/200, RSI, MACD, ATR, ADX, volume ratio and support/resistance.
-- Agreed setup paths: Momentum, Horizontal Range rejection, and BRR (1h breakout/retest with 15m confirmation).
-- Risk-based sizing with configurable risk, leverage and a hard per-trade margin cap.
-- SAFE and ADVENTURER profiles change risk sizing; AI does not choose leverage or order size.
-- Telegram AUTO/MANUAL control, status, symbol management, manual order entry, scan, trade history, stats and close-all confirmation.
-- Local PAPER execution remains available.
-- Bitget DEMO execution is now supported when explicitly armed.
-- Entry orders include exchange-side preset stop-loss and take-profit; the bot verifies both protections before recording the trade locally.
-- Demo reconciliation reads exchange positions/history so exchange-side SL/TP closes can be reflected in the journal.
-- LIVE order execution remains intentionally unsupported in this release.
+## Features
 
-## Bitget Demo requirements
+- Bitget USDT perpetual market data via CCXT, with explicit market-symbol validation (no silent symbol substitutions).
+- Multi-timeframe technical analysis: EMA 20/50/200, RSI, MACD, ATR, ADX, volume ratio and rolling support/resistance.
+- Conservative signal threshold and separate risk checks.
+- SQLite symbol watchlist and commands to add/enable/disable/remove symbols from Telegram.
+- Telegram allowlist: both messages and callbacks fail closed if the user is not allowed; commands are disabled when the allowlist is empty.
+- Paper trading: local entries, simulated stop/target monitoring, PnL, R multiple, daily loss guard, trade history and statistics.
+- Manual paper-trade logging through Telegram.
+- Research backtest module with win rate, average R, profit factor and max drawdown in R.
+- SAFE and ADVENTURER profiles affect paper risk sizing only.
+- Docker and systemd examples for a Linux VPS. Hosting provider specifics can be added after the target provider is confirmed.
 
-Bitget states that Demo API trading requires a Demo API Key created while the account is in Demo mode and the demo-trading header (`paptrading: 1`). CCXT exposes this through `set_sandbox_mode(True)`. urlBitget Demo Trading APIhttps://www.bitget.com/docs/classic/demo-trading/rest-api
+## Quick start
 
-The app therefore requires all of these for exchange execution:
+1. Install Python 3.11+.
+2. Clone this repository and enter the directory.
+3. Create an environment and install dependencies:
 
-```text
-TRADING_ENV=bitget_demo
-TRADING_MODE=AUTO
-ENABLE_EXCHANGE_ORDERS=true
-DEMO_TRADING_ARMED=true
-BITGET_DEMO=true
-BITGET_API_KEY=<Demo API key>
-BITGET_API_SECRET=<Demo API secret>
-BITGET_API_PASSPHRASE=<Demo API passphrase>
-```
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -e '.[test]'
+   cp .env.example .env
+   ```
 
-If any execution gate is missing, the app stays read-only and refuses AUTO Demo execution.
+4. Create a **new** Telegram bot with `@BotFather`. Put its token in `.env`; add your numeric Telegram user ID to `TELEGRAM_ALLOWED_USER_IDS`.
+5. Start with `TRADING_ENV=paper`, `TRADING_MODE=MANUAL`, and `ENABLE_EXCHANGE_ORDERS=false`.
+6. Run tests: `pytest -q`
+7. Run: `python main.py`
+8. Telegram commands: `/start`, `/status`, `/coins`, `/scan`, `/mode MANUAL`, `/profile SAFE`, `/trades`, `/stats`.
 
-## Risk defaults
+## Telegram commands
 
-```text
-STARTING_CAPITAL=1000
-RISK_PER_TRADE=0.01
-MAX_DAILY_LOSS=0.03
-MAX_OPEN_POSITIONS=3
-LEVERAGE=10
-MAX_LEVERAGE=20
-MAX_MARGIN_PER_TRADE=5
-MARGIN_MODE=isolated
-MIN_TECH_SCORE=65
-SCAN_SECONDS=60
-```
-
-The leverage value is configuration, not an AI decision. The per-trade margin cap is an additional guard for the small-account/demo test.
-
-## Telegram
-
-- `/start` — help + control panel
-- `/status`
 - `/coins`
-- `/coin_add SYMBOL`
-- `/coin_enable SYMBOL`
-- `/coin_disable SYMBOL`
-- `/coin_remove SYMBOL`
-- `/mode MANUAL` or `/mode AUTO`
+- `/coin_add FET/USDT:USDT`
+- `/coin_enable FET/USDT:USDT`
+- `/coin_disable FET/USDT:USDT`
+- `/coin_remove FET/USDT:USDT` (refuses removal while a local paper trade is open)
+- `/mode MANUAL` or `/mode AUTO` (AUTO is allowed only in PAPER mode)
 - `/profile SAFE` or `/profile ADVENTURER`
-- `/scan` — analysis only, no order
-- `/open SYMBOL LONG|SHORT ENTRY STOP TARGET` — manual order in the current environment
-- `/closeall` then `/closeall confirm`
-- `/trades`
-- `/stats`
+- `/scan`
+- `/open FET/USDT:USDT LONG 1.20 1.17 1.26` (manual **paper** trade; sample prices are illustrative)
+- `/closeall`, then `/closeall confirm` (closes all local paper trades at the latest fetched ticker prices)
+- `/trades`, `/stats`
 
-## Important execution behavior
+## Configuration
 
-AUTO is allowed in PAPER or armed BITGET DEMO. MANUAL is always available. `/scan` never opens a trade. Demo entries are not considered successful until the exchange returns a fill and the bot can verify exchange-side stop-loss and take-profit protection.
+See `.env.example`. Never commit `.env` or exchange credentials. Use a **separate** Telegram bot and a new database for this lab. Never reuse the old bot token if it has been exposed.
 
-## Tests
+## Deploy on a Linux VPS
 
-Run:
+The repository includes a Dockerfile and `deploy/khtb-lab.service.example`. For a free VPS, create the server, create a non-root service user, install Docker or Python, upload/clone the repository, add `.env`, then enable the service. Free compute offers can have region, capacity, verification, and resource limits; no uptime guarantee is implied.
 
-```bash
-pytest -q
-```
+## What is not certified yet
 
-The repository test suite covers configuration gates, indicators/strategy, risk, database lifecycle and the Demo execution adapter with mocked exchange responses. Passing tests are not a substitute for the first real Bitget Demo end-to-end test.
+- Bitget demo order placement and exchange-side SL/TP creation/read-back.
+- Automatic live trading, live closing, and real account reconciliation. Live order sending is intentionally unsupported.
+- AI commentary is not in the critical trading path; the current signal engine is deterministic technical analysis.
+- Backtest is research-grade, omits fees/slippage/funding and needs walk-forward validation before strategy conclusions.
+- A successful test suite is not an exchange end-to-end test.
+
+Do not enable real trading based on this lab package. The next implementation gate for exchange-demo orders is a tested Bitget-specific order/protection adapter with independent verification of fill, stop-loss and take-profit after every entry.
