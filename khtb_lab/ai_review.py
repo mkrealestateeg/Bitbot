@@ -11,16 +11,21 @@ log = logging.getLogger(__name__)
 
 class AIReviewer:
     """
-    Optional AI commentary for technically qualified opportunities.
+    Reviews technically qualified opportunities using Gemini.
 
-    AI failure is reported explicitly. It is never treated as approval
-    to execute a trade.
+    Cooldown applies only after a successful AI response for the
+    same symbol and materially similar opportunity.
+
+    Failed requests never become approvals and never start cooldown.
     """
 
     def __init__(self, settings):
         self.settings = settings
         self.keys = list(settings.gemini_api_pool)
         self.index = 0
+
+        # symbol -> {"time": timestamp, "signature": tuple}
+        # Stored in memory for the lifetime of this process.
         self.last = {}
 
     @staticmethod
@@ -36,6 +41,66 @@ class AIReviewer:
             "comment": str(comment)[:300],
             "status": status,
         }
+
+    @staticmethod
+    def _number(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _opportunity_signature(cls, signal):
+        """
+        Build a stable fingerprint for a qualified opportunity.
+
+        Small price fluctuations alone should not bypass cooldown.
+        A change in direction, setup, score band, or risk/target
+        distances can represent a materially different opportunity.
+        """
+        direction = str(
+            signal.get("direction", "")
+        ).upper().strip()
+
+        setup = str(
+            signal.get("setup", "")
+        ).upper().strip()
+
+        score = cls._number(signal.get("score"))
+        entry = cls._number(signal.get("price"))
+        stop = cls._number(signal.get("stop"))
+        target = cls._number(signal.get("target"))
+
+        score_band = (
+            int(score // 10)
+            if score is not None
+            else None
+        )
+
+        if entry is not None and entry > 0:
+            stop_distance_pct = (
+                round(abs(entry - stop) / entry * 100, 1)
+                if stop is not None
+                else None
+            )
+
+            target_distance_pct = (
+                round(abs(target - entry) / entry * 100, 1)
+                if target is not None
+                else None
+            )
+        else:
+            stop_distance_pct = None
+            target_distance_pct = None
+
+        return (
+            direction,
+            setup,
+            score_band,
+            stop_distance_pct,
+            target_distance_pct,
+        )
 
     @staticmethod
     def _parse_response(text):
@@ -56,23 +121,39 @@ class AIReviewer:
         data = json.loads(text)
 
         if not isinstance(data, dict):
-            raise ValueError("AI response must be a JSON object")
+            raise ValueError(
+                "AI response must be a JSON object"
+            )
 
-        decision = str(data.get("decision", "")).upper().strip()
+        decision = str(
+            data.get("decision", "")
+        ).upper().strip()
 
-        if decision not in {"TAKE", "IGNORE", "CONSIDER"}:
+        if decision not in {
+            "TAKE",
+            "IGNORE",
+            "CONSIDER",
+        }:
             raise ValueError("Invalid AI decision")
 
         try:
-            confidence = float(data.get("confidence", 0))
+            confidence = float(
+                data.get("confidence", 0)
+            )
         except (TypeError, ValueError):
             confidence = 0
 
         if not math.isfinite(confidence):
             confidence = 0
 
-        confidence = max(0.0, min(100.0, confidence))
-        comment = str(data.get("comment", ""))[:300]
+        confidence = max(
+            0.0,
+            min(100.0, confidence),
+        )
+
+        comment = str(
+            data.get("comment", "")
+        )[:300]
 
         return decision, confidence, comment
 
@@ -85,7 +166,10 @@ class AIReviewer:
             )
             return self._result(
                 "NOT_REVIEWED",
-                comment="AI review is disabled; technical signal remains available.",
+                comment=(
+                    "AI review is disabled; "
+                    "technical signal remains available."
+                ),
                 status="DISABLED",
             )
 
@@ -101,30 +185,48 @@ class AIReviewer:
             )
 
         now = time.time()
+
         cooldown = max(
             0,
-            int(getattr(self.settings, "ai_review_cooldown", 900)),
+            int(
+                getattr(
+                    self.settings,
+                    "ai_review_cooldown",
+                    300,
+                )
+            ),
         )
-        last_review = self.last.get(symbol, 0)
 
-        if now - last_review < cooldown:
-            remaining = int(cooldown - (now - last_review))
+        signature = self._opportunity_signature(signal)
+        previous = self.last.get(symbol)
 
-            log.info(
-                "AI REVIEW SKIPPED | symbol=%s | reason=cooldown | "
-                "remaining=%ss",
-                symbol,
-                remaining,
-            )
+        # Apply cooldown only to a materially similar opportunity.
+        if previous and previous["signature"] == signature:
+            elapsed = now - previous["time"]
 
-            return self._result(
-                "NOT_REVIEWED",
-                comment=f"AI cooldown active; retry in about {remaining}s.",
-                status="COOLDOWN",
-            )
+            if elapsed < cooldown:
+                remaining = max(
+                    0,
+                    int(cooldown - elapsed),
+                )
 
-        self.last[symbol] = now
+                log.info(
+                    "AI REVIEW SKIPPED | symbol=%s | "
+                    "reason=cooldown | remaining=%ss",
+                    symbol,
+                    remaining,
+                )
 
+                return self._result(
+                    "NOT_REVIEWED",
+                    comment=(
+                        "Same opportunity is within AI cooldown; "
+                        f"retry in about {remaining}s."
+                    ),
+                    status="COOLDOWN",
+                )
+
+        # Rotate through configured Gemini keys.
         key = self.keys[self.index % len(self.keys)]
         self.index += 1
 
@@ -168,21 +270,40 @@ Technical reason: {signal.get("reason")}
                 contents=prompt,
             )
 
-            response_text = getattr(response, "text", None)
-
-            if not response_text or not response_text.strip():
-                raise ValueError("Gemini returned an empty response")
-
-            decision, confidence, comment = self._parse_response(
-                response_text
+            response_text = getattr(
+                response,
+                "text",
+                None,
             )
 
+            if (
+                not response_text
+                or not response_text.strip()
+            ):
+                raise ValueError(
+                    "Gemini returned an empty response"
+                )
+
+            decision, confidence, comment = (
+                self._parse_response(response_text)
+            )
+
+            # Record cooldown only after a valid AI response.
+            # A TAKE, CONSIDER, or IGNORE response counts as
+            # a successful review; API/parse failures do not.
+            self.last[symbol] = {
+                "time": time.time(),
+                "signature": signature,
+            }
+
             log.info(
-                "AI REVIEW COMPLETE | symbol=%s | decision=%s | "
-                "confidence=%.1f",
+                "AI REVIEW COMPLETE | symbol=%s | "
+                "decision=%s | confidence=%.1f | "
+                "cooldown=%ss",
                 symbol,
                 decision,
                 confidence,
+                cooldown,
             )
 
             return self._result(
@@ -194,16 +315,19 @@ Technical reason: {signal.get("reason")}
 
         except Exception as exc:
             log.exception(
-                "AI REVIEW FAILED | symbol=%s",
+                "AI REVIEW FAILED | symbol=%s | "
+                "cooldown_not_started=true",
                 symbol,
             )
 
-            # Never convert an API failure into approval.
+            # Never turn an API failure into approval.
+            # Do not update self.last here.
             return self._result(
                 "NOT_REVIEWED",
                 comment=(
-                    f"AI review unavailable ({type(exc).__name__}). "
-                    "Technical signal retained; no AI approval."
+                    f"AI review unavailable "
+                    f"({type(exc).__name__}). "
+                    "No AI approval was received."
                 ),
                 status="ERROR",
             )
