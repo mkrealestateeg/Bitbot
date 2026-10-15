@@ -79,12 +79,28 @@ class KhtbLab:
         self.last_scan=time.strftime("%Y-%m-%d %H:%M:%S");self.last_result=f"Completed scan; symbols={len(self.db.enabled_symbols())}"
         return self.last_result
     def status_text(self):
-        equity=self.execution.equity() if self.settings.trading_env in {"DEMO","LIVE"} else self.paper.capital
-        armed="YES" if ((self.settings.trading_env=="DEMO" and self.settings.demo_armed) or(self.settings.trading_env=="LIVE" and self.settings.live_armed)) else "NO"
-        return (f"🤖 Khtb Lab {self.settings.bot_version}\n\nExchange: {self.settings.exchange_name}\nEnvironment: {self.settings.trading_env}\n"
-                f"Mode: {self.mode}\nProfile: {self.profile}\nExecution Armed: {armed}\nOrder Sending: {'ON' if self.settings.enable_exchange_orders else 'OFF'}\n"
-                f"Symbols: {len(self.db.enabled_symbols())}\nOpen Trades: {len(self.db.open_trades())}\nEquity: {equity if equity is not None else 0:.2f}\n"
-                f"Daily PnL: {self.db.daily_pnl():.4f}\nLast Scan: {self.last_scan}")
+        equity = self.execution.equity() if self.settings.trading_env in {"DEMO", "LIVE"} else self.paper.capital
+        available = self.execution.available() if self.settings.trading_env in {"DEMO", "LIVE"} else self.paper.capital
+        armed = "YES" if (
+            (self.settings.trading_env == "DEMO" and self.settings.demo_armed)
+            or (self.settings.trading_env == "LIVE" and self.settings.live_armed)
+        ) else "NO"
+        return (
+            f"🤖 Khtb Lab {self.settings.bot_version}\n\n"
+            f"Exchange: {self.settings.exchange_name}\n"
+            f"Environment: {self.settings.trading_env}\n"
+            f"Account: {self.settings.account_type} / {self.settings.product_category}\n"
+            f"Mode: {self.mode}\nProfile: {self.profile}\n"
+            f"Margin: {self.settings.margin_mode} | Position: {self.settings.position_mode}\n"
+            f"Execution Armed: {armed}\n"
+            f"Order Sending: {'ON' if self.settings.enable_exchange_orders else 'OFF'}\n"
+            f"Symbols: {len(self.db.enabled_symbols())}\n"
+            f"Open Trades: {len(self.db.open_trades())}\n"
+            f"Equity: {equity if equity is not None else 0:.2f} USDT\n"
+            f"Available: {available if available is not None else 0:.2f} USDT\n"
+            f"Daily PnL: {self.db.daily_pnl():.4f}\n"
+            f"Last Scan: {self.last_scan}"
+        )
     def backtest_symbol(self,s):
         s=self.market.validate_symbol(s);return run_backtest(self.market.candles(s,self.settings.timeframe_main,1000),self.market.candles(s,self.settings.timeframe_trend,1000),self.market.candles(s,self.settings.timeframe_context,1000))
     def run(self,telegram=None):

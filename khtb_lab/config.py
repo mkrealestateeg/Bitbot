@@ -32,6 +32,12 @@ class Settings:
     live_api_secret: str=os.getenv("LIVE_API_SECRET","").strip()
     live_api_password: str=os.getenv("LIVE_API_PASSWORD","").strip()
     trading_env: str=os.getenv("TRADING_ENV","DEMO").strip().upper()
+    account_type: str=os.getenv("ACCOUNT_TYPE","UTA").strip().upper()
+    product_category: str=os.getenv("PRODUCT_CATEGORY","USDT-FUTURES").strip().upper()
+    margin_mode: str=os.getenv("MARGIN_MODE","crossed").strip().lower()
+    position_mode: str=os.getenv("POSITION_MODE","one_way").strip().lower()
+    bitget_base_url: str=os.getenv("BITGET_BASE_URL","https://api.bitget.com").strip().rstrip("/")
+    request_timeout: int=_int("EXCHANGE_REQUEST_TIMEOUT",15)
     trading_mode: str=os.getenv("TRADING_MODE","MANUAL").strip().upper()
     enable_exchange_orders: bool=_bool("ENABLE_EXCHANGE_ORDERS",False)
     demo_armed: bool=_bool("DEMO_TRADING_ARMED",False)
@@ -57,11 +63,15 @@ class Settings:
     ai_review_cooldown: int=_int("AI_REVIEW_COOLDOWN",900)
     notify_technical_opportunity: bool=_bool("NOTIFY_TECHNICAL_OPPORTUNITY",True)
     notify_auto_ready: bool=_bool("NOTIFY_AUTO_READY",True)
-    bot_version: str="V3.1-UNIFIED-FINAL"
+    bot_version: str="V3.2-UTA-FINAL"
 
     def validate(self):
         if self.trading_env not in {"PAPER","DEMO","LIVE"}: raise ValueError("TRADING_ENV must be PAPER, DEMO, or LIVE")
         if self.trading_mode not in {"MANUAL","AUTO"}: raise ValueError("TRADING_MODE must be MANUAL or AUTO")
+        if self.account_type not in {"UTA"}: raise ValueError("ACCOUNT_TYPE must be UTA for this build")
+        if self.product_category not in {"USDT-FUTURES"}: raise ValueError("PRODUCT_CATEGORY must be USDT-FUTURES")
+        if self.margin_mode not in {"crossed","isolated"}: raise ValueError("MARGIN_MODE must be crossed or isolated")
+        if self.position_mode not in {"one_way","hedge"}: raise ValueError("POSITION_MODE must be one_way or hedge")
         if not 0 < self.risk_per_trade <= .02: raise ValueError("RISK_PER_TRADE must be >0 and <=0.02")
         if not 0 < self.max_daily_loss <= .10: raise ValueError("MAX_DAILY_LOSS must be >0 and <=0.10")
         if self.max_open_positions<1: raise ValueError("MAX_OPEN_POSITIONS must be >=1")

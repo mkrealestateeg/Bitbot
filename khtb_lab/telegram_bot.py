@@ -67,5 +67,10 @@ class TelegramBot:
         elif cmd=="/closeall" and args==["confirm"]:
             if self.app.settings.trading_env=="PAPER":
                 closed=self.app.paper.close_all(self.app.get_prices(self.app.db.enabled_symbols()));self.send(chat,f"Closed {len(closed)} paper trades.",self.keyboard())
-            else:self.send(chat,"⚠️ Exchange close-all requires the exchange position reconciliation module; no live/demo order was sent by this command.",self.keyboard())
+            else:
+                result=self.app.execution.close_all()
+                if result.get("success"):
+                    self.send(chat,"🛑 CLOSE ALL request sent to Bitget UTA.",self.keyboard())
+                else:
+                    self.send(chat,f"⚠️ CLOSE ALL blocked/failed: {result.get('error','unknown')}",self.keyboard())
         else:self.send(chat,"Unknown command. Use /start.",self.keyboard())
