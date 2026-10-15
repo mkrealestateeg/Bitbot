@@ -181,6 +181,8 @@ class Settings:
         "TIMEFRAME_CONTEXT", "4h"
     )
 
+    # Kept for possible future entry-timing improvements.
+    # This timeframe is not activated by this setting alone.
     timeframe_entry: str = os.getenv(
         "TIMEFRAME_ENTRY", "5m"
     )
@@ -219,16 +221,18 @@ class Settings:
     )
 
     gemini_model: str = os.getenv(
-        "GEMINI_MODEL", "gemini-2.5-flash"
+        "GEMINI_MODEL", "gemini-3.5-flash-lite"
     ).strip()
 
-    # Updated default technical threshold: 65
+    # Minimum technical score before requesting AI review.
     ai_min_tech_score: float = _float(
         "AI_MIN_TECH_SCORE", 65.0
     )
 
+    # Default Gemini cooldown: 5 minutes.
+    # An explicitly configured Railway variable overrides this value.
     ai_review_cooldown: int = _int(
-        "AI_REVIEW_COOLDOWN", 900
+        "AI_REVIEW_COOLDOWN", 300
     )
 
     notify_technical_opportunity: bool = _bool(
@@ -310,7 +314,7 @@ class Settings:
                 "EXCHANGE_REQUEST_TIMEOUT must be >=1"
             )
 
-        if self.ai_min_tech_score < 0 or self.ai_min_tech_score > 100:
+        if not 0 <= self.ai_min_tech_score <= 100:
             raise ValueError(
                 "AI_MIN_TECH_SCORE must be between 0 and 100"
             )
