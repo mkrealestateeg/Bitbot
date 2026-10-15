@@ -1,112 +1,586 @@
+
 from __future__ import annotations
-import logging,time
+
+import logging
+import time
+
 from .config import Settings
 from .database import Database
 from .market import Market
 from .strategy import analyze
-from .risk import risk_check,position_size
+from .risk import risk_check, position_size
 from .paper import PaperBroker
 from .execution import ExecutionEngine
 from .ai_review import AIReviewer
 from .backtest import run_backtest
-log=logging.getLogger(__name__)
+
+log = logging.getLogger(__name__)
+
+
 class KhtbLab:
-    def __init__(self,settings):
-        settings.validate();self.settings=settings;self.db=Database(settings.db_path);self.db.seed_symbols(settings.symbols)
-        self.market=Market(settings);self.mode=settings.trading_mode;self.profile="SAFE";self.paper=PaperBroker(settings,self.db);self.execution=ExecutionEngine(settings)
-        self.ai=AIReviewer(settings);self.last_scan="Never";self.last_result="Not scanned";self.telegram=None;self.market.load()
-    def paper_qty(self,entry,stop):
-        return position_size(self.paper.capital,entry,stop,self.settings.risk_per_trade*(.5 if self.profile=="SAFE" else 1))
-    def get_prices(self,symbols):
-        out={}
-        for s in symbols:
-            try:out[s]=float(self.market.ticker(s).get("last") or 0)
-            except Exception:log.exception("Ticker failed %s",s)
-        return out
-    def notify(self,text):
-        if self.telegram:self.telegram.broadcast(text)
-    def opportunity_text(self,symbol,sig,ai=None):
-        decision=(ai or {}).get("decision","NOT_REVIEWED");conf=(ai or {}).get("confidence",0);comment=(ai or {}).get("comment","")
-        return (f"🟡 OPPORTUNITY READY\n{symbol}\nDirection: {sig['direction']}\nTechnical: {sig['score']:.0f}\n"
-                f"AI: {decision} ({conf:.0f}%)\nEntry: {sig['price']:.8g}\nSL: {sig['stop']:.8g}\nTP: {sig['target']:.8g}\n"
-                f"Setup: {sig.get('setup','')}\n{comment}")
-    def scan_once(self,allow_auto=True):
-        messages=[];prices={}
-        for symbol in self.db.enabled_symbols():
+    def __init__(self, settings):
+        settings.validate()
+        self.settings = settings
+        self.db = Database(settings.db_path)
+        self.db.seed_symbols(settings.symbols)
+
+        self.market = Market(settings)
+        self.mode = settings.trading_mode
+        self.profile = "SAFE"
+        self.paper = PaperBroker(settings, self.db)
+        self.execution = ExecutionEngine(settings)
+        self.ai = AIReviewer(settings)
+
+        self.last_scan = "Never"
+        self.last_result = "Not scanned"
+        self.telegram = None
+
+        self.market.load()
+
+        log.info(
+            "BOT INITIALIZED | env=%s | mode=%s | symbols=%s | "
+            "AI_enabled=%s | technical_threshold=%s",
+            self.settings.trading_env,
+            self.mode,
+            len(self.db.enabled_symbols()),
+            self.settings.enable_ai_review,
+            self.settings.ai_min_tech_score,
+        )
+
+    def paper_qty(self, entry, stop):
+        risk_fraction = self.settings.risk_per_trade * (
+            0.5 if self.profile == "SAFE" else 1
+        )
+        return position_size(
+            self.paper.capital,
+            entry,
+            stop,
+            risk_fraction,
+        )
+
+    def get_prices(self, symbols):
+        prices = {}
+
+        for symbol in symbols:
             try:
-                sig=analyze(self.market.candles(symbol,self.settings.timeframe_main,250),self.market.candles(symbol,self.settings.timeframe_trend,250),self.market.candles(symbol,self.settings.timeframe_context,250));prices[symbol]=sig.get("price",0)
-                self.db.save_signal(symbol,sig["direction"],sig["price"],sig["score"],sig.get("setup",""),sig.get("reason",""),sig.get("snapshot",{}))
-                if sig.get("direction") not in {"LONG","SHORT"} or sig.get("score",0)<self.settings.ai_min_tech_score:
-                    log.info("FILTER %s score=%s direction=%s | Gemini skipped",symbol,sig.get("score"),sig.get("direction"));continue
-                log.info("OPPORTUNITY %s score=%s | sending to Gemini",symbol,sig["score"])
-                ai=self.ai.review(symbol,sig)
-                if ai is None:
-                    log.info("AI review skipped/cooldown/disabled for %s",symbol);continue
-                self.notify(self.opportunity_text(symbol,sig,ai)) if self.settings.notify_technical_opportunity else None
-                if ai.get("decision") not in {"TAKE","CONSIDER"}:
-                    continue
-                capital=self.paper.capital if self.settings.trading_env=="PAPER" else self.execution.equity()
-                if capital is None:
-                    self.notify(f"⚠️ {symbol} BLOCKED\nEquity unavailable; no order sent.")
-                    continue
-                ok,why=risk_check(self.settings,self.db,sig,capital)
-                if not ok:
-                    log.info("RISK BLOCK %s: %s",symbol,why);continue
-                if not allow_auto or self.mode!="AUTO":
-                    continue
-                if self.settings.trading_env=="PAPER":
-                    if not any(t["symbol"]==symbol for t in self.db.open_trades()):
-                        tid=self.paper.open(symbol,sig,"AUTO")
-                        if tid:self.notify(f"🟢 PAPER TRADE OPENED\n{symbol} {sig['direction']}\nEntry: {sig['price']:.8g}\nSL: {sig['stop']:.8g}\nTP: {sig['target']:.8g}")
-                    continue
-                if any(t["symbol"]==symbol for t in self.db.open_trades()):continue
-                qty=min(position_size(capital,sig["price"],sig["stop"],self.settings.risk_per_trade*(.5 if self.profile=="SAFE" else 1)),self.settings.max_margin_per_trade*self.settings.leverage/max(sig["price"],1e-12))
-                plan=self.execution.prepare(symbol,sig["direction"],qty,sig["price"],sig["stop"],sig["target"])
-                if not plan["ready"]:
-                    log.info("AUTO BLOCK %s: %s",symbol,plan["error"]);continue
-                if self.settings.notify_auto_ready:self.notify(f"🟢 AUTO TRADE READY\n{symbol} {sig['direction']}\nEntry: {sig['price']:.8g}\nSL: {sig['stop']:.8g}\nTP: {sig['target']:.8g}\nQty: {qty:.8g}\nSending order...")
-                result=self.execution.execute(plan)
-                if result.get("success"):
-                    tid=self.db.open_trade(symbol,sig["direction"],result["average"],sig["stop"],sig["target"],result["filled_quantity"],mode="AUTO",source=self.settings.trading_env,snapshot=sig.get("snapshot"))
-                    self.notify(f"✅ TRADE OPENED\n{symbol} {sig['direction']}\nOrder: {result['order_id']}\nEntry fill: {result['average']:.8g}\nSL: {sig['stop']:.8g}\nTP: {sig['target']:.8g}\nTrade ID: {tid}")
-                else:
-                    self.notify(f"⚠️ EXECUTION FAILED\n{symbol}\n{result.get('error','unknown')}")
-            except Exception as e:
-                log.exception("Scan failed %s",symbol)
-        if self.settings.trading_env=="PAPER":
-            for tid,reason,pnl in self.paper.mark(prices):
-                self.notify(f"🔴 PAPER TRADE CLOSED\nTrade #{tid}\n{reason}\nPnL: {pnl:.6f}")
-        self.last_scan=time.strftime("%Y-%m-%d %H:%M:%S");self.last_result=f"Completed scan; symbols={len(self.db.enabled_symbols())}"
+                ticker = self.market.ticker(symbol)
+                prices[symbol] = float(ticker.get("last") or 0)
+            except Exception:
+                log.exception("TICKER FAILED | symbol=%s", symbol)
+
+        return prices
+
+    def notify(self, message):
+        if self.telegram:
+            try:
+                self.telegram.broadcast(message)
+            except Exception:
+                log.exception("TELEGRAM NOTIFICATION FAILED")
+
+    def opportunity_text(self, symbol, signal, ai=None):
+        ai = ai or {}
+        decision = ai.get("decision", "NOT_REVIEWED")
+        confidence = ai.get("confidence", 0)
+        comment = ai.get("comment", "")
+        ai_status = ai.get("status", "UNKNOWN")
+
+        return (
+            f"🟡 OPPORTUNITY READY\n"
+            f"{symbol}\n"
+            f"Direction: {signal['direction']}\n"
+            f"Technical: {signal['score']:.0f}\n"
+            f"Setup: {signal.get('setup', '')}\n"
+            f"AI: {decision} ({confidence:.0f}%)\n"
+            f"AI status: {ai_status}\n"
+            f"Entry: {signal['price']:.8g}\n"
+            f"SL: {signal['stop']:.8g}\n"
+            f"TP: {signal['target']:.8g}\n"
+            f"{comment}"
+        )
+
+    def _review_ai(self, symbol, signal):
+        log.info(
+            "AI REVIEW START | symbol=%s | setup=%s | score=%.1f",
+            symbol,
+            signal.get("setup", ""),
+            float(signal.get("score", 0)),
+        )
+
+        result = self.ai.review(symbol, signal)
+
+        if not isinstance(result, dict):
+            log.error(
+                "AI REVIEW INVALID RESULT | symbol=%s | result_type=%s",
+                symbol,
+                type(result).__name__,
+            )
+            return {
+                "decision": "NOT_REVIEWED",
+                "confidence": 0,
+                "comment": "AI returned an invalid result; trade not approved.",
+                "status": "ERROR",
+            }
+
+        log.info(
+            "AI REVIEW RESULT | symbol=%s | decision=%s | status=%s | "
+            "confidence=%s",
+            symbol,
+            result.get("decision", "NOT_REVIEWED"),
+            result.get("status", "UNKNOWN"),
+            result.get("confidence", 0),
+        )
+
+        return result
+
+    def _process_symbol(self, symbol, prices, allow_auto):
+        log.info("SCAN START | symbol=%s", symbol)
+
+        main_frame = self.market.candles(
+            symbol, self.settings.timeframe_main, 250
+        )
+        trend_frame = self.market.candles(
+            symbol, self.settings.timeframe_trend, 250
+        )
+        context_frame = self.market.candles(
+            symbol, self.settings.timeframe_context, 250
+        )
+
+        log.info(
+            "MARKET DATA READY | symbol=%s | main=%s | trend=%s | context=%s",
+            symbol,
+            len(main_frame),
+            len(trend_frame),
+            len(context_frame),
+        )
+
+        signal = analyze(main_frame, trend_frame, context_frame)
+
+        direction = signal.get("direction", "NEUTRAL")
+        score = float(signal.get("score", 0) or 0)
+        entry = float(signal.get("price", 0) or 0)
+
+        prices[symbol] = entry
+
+        self.db.save_signal(
+            symbol,
+            direction,
+            entry,
+            score,
+            signal.get("setup", ""),
+            signal.get("reason", ""),
+            signal.get("snapshot", {}),
+        )
+
+        log.info(
+            "EVALUATION COMPLETE | symbol=%s | direction=%s | score=%.1f | "
+            "setup=%s | entry=%s",
+            symbol,
+            direction,
+            score,
+            signal.get("setup", ""),
+            entry,
+        )
+
+        threshold = float(self.settings.ai_min_tech_score)
+
+        if direction not in {"LONG", "SHORT"}:
+            log.info(
+                "EVALUATION FILTER | symbol=%s | reason=no_directional_signal",
+                symbol,
+            )
+            return
+
+        if score < threshold:
+            log.info(
+                "EVALUATION FILTER | symbol=%s | score=%.1f | threshold=%.1f",
+                symbol,
+                score,
+                threshold,
+            )
+            return
+
+        log.info(
+            "OPPORTUNITY QUALIFIED | symbol=%s | direction=%s | score=%.1f",
+            symbol,
+            direction,
+            score,
+        )
+
+        ai = self._review_ai(symbol, signal)
+
+        if self.settings.notify_technical_opportunity:
+            self.notify(self.opportunity_text(symbol, signal, ai))
+
+        decision = str(ai.get("decision", "NOT_REVIEWED")).upper()
+        ai_status = str(ai.get("status", "UNKNOWN")).upper()
+
+        # AI failure, disabled review, missing keys, and cooldown are not approval.
+        if decision not in {"TAKE", "CONSIDER"} or ai_status != "OK":
+            log.info(
+                "TRADE NOT APPROVED | symbol=%s | decision=%s | AI_status=%s",
+                symbol,
+                decision,
+                ai_status,
+            )
+            return
+
+        if not allow_auto or self.mode != "AUTO":
+            log.info(
+                "NO AUTOMATIC ORDER | symbol=%s | allow_auto=%s | mode=%s",
+                symbol,
+                allow_auto,
+                self.mode,
+            )
+            return
+
+        if self.settings.trading_env == "LIVE":
+            log.warning(
+                "LIVE ENVIRONMENT SELECTED | symbol=%s | execution remains "
+                "subject to all LIVE configuration gates",
+                symbol,
+            )
+
+        if self.settings.trading_env == "PAPER":
+            capital = self.paper.capital
+        else:
+            can_execute, execute_reason = self.execution.can_execute()
+
+            if not can_execute:
+                log.warning(
+                    "EXECUTION GATE BLOCKED | symbol=%s | reason=%s",
+                    symbol,
+                    execute_reason,
+                )
+                return
+
+            capital = self.execution.equity()
+
+        if capital is None or capital <= 0:
+            log.warning(
+                "RISK BLOCK | symbol=%s | reason=equity_unavailable",
+                symbol,
+            )
+            if self.mode == "AUTO":
+                self.notify(
+                    f"⚠️ {symbol} BLOCKED\n"
+                    f"Account equity unavailable. No order was sent."
+                )
+            return
+
+        ok, reason = risk_check(
+            self.settings,
+            self.db,
+            signal,
+            capital,
+        )
+
+        if not ok:
+            log.warning(
+                "RISK BLOCK | symbol=%s | reason=%s",
+                symbol,
+                reason,
+            )
+            return
+
+        log.info(
+            "RISK CHECK PASSED | symbol=%s | capital=%.4f",
+            symbol,
+            capital,
+        )
+
+        if any(
+            trade["symbol"] == symbol
+            for trade in self.db.open_trades()
+        ):
+            log.info(
+                "ORDER SKIPPED | symbol=%s | reason=position_already_open",
+                symbol,
+            )
+            return
+
+        risk_fraction = self.settings.risk_per_trade * (
+            0.5 if self.profile == "SAFE" else 1
+        )
+
+        quantity = position_size(
+            capital,
+            signal["price"],
+            signal["stop"],
+            risk_fraction,
+        )
+
+        if self.settings.trading_env != "PAPER":
+            max_quantity_by_margin = (
+                self.settings.max_margin_per_trade
+                * self.settings.leverage
+                / max(signal["price"], 1e-12)
+            )
+            quantity = min(quantity, max_quantity_by_margin)
+
+        if quantity <= 0:
+            log.warning(
+                "ORDER BLOCKED | symbol=%s | reason=quantity_not_positive",
+                symbol,
+            )
+            return
+
+        if self.settings.trading_env == "PAPER":
+            trade_id = self.paper.open(symbol, signal, "AUTO")
+
+            if trade_id:
+                log.info(
+                    "PAPER TRADE OPENED | symbol=%s | trade_id=%s",
+                    symbol,
+                    trade_id,
+                )
+                self.notify(
+                    f"🟢 PAPER TRADE OPENED\n"
+                    f"{symbol} {direction}\n"
+                    f"Entry: {signal['price']:.8g}\n"
+                    f"SL: {signal['stop']:.8g}\n"
+                    f"TP: {signal['target']:.8g}"
+                )
+            else:
+                log.warning(
+                    "PAPER TRADE NOT OPENED | symbol=%s",
+                    symbol,
+                )
+            return
+
+        log.info(
+            "ORDER PREPARATION START | symbol=%s | quantity=%s | env=%s",
+            symbol,
+            quantity,
+            self.settings.trading_env,
+        )
+
+        plan = self.execution.prepare(
+            symbol,
+            direction,
+            quantity,
+            signal["price"],
+            signal["stop"],
+            signal["target"],
+        )
+
+        if not plan.get("ready"):
+            log.warning(
+                "ORDER PREPARATION BLOCKED | symbol=%s | reason=%s",
+                symbol,
+                plan.get("error", "unknown"),
+            )
+            return
+
+        if self.settings.notify_auto_ready:
+            self.notify(
+                f"🟢 AUTO TRADE READY\n"
+                f"{symbol} {direction}\n"
+                f"Entry: {signal['price']:.8g}\n"
+                f"SL: {signal['stop']:.8g}\n"
+                f"TP: {signal['target']:.8g}\n"
+                f"Qty: {quantity:.8g}\n"
+                f"Environment: {self.settings.trading_env}\n"
+                f"Submitting order..."
+            )
+
+        log.info(
+            "ORDER SUBMISSION START | symbol=%s | direction=%s | quantity=%s",
+            symbol,
+            direction,
+            quantity,
+        )
+
+        result = self.execution.execute(plan)
+
+        if result.get("success"):
+            trade_id = self.db.open_trade(
+                symbol,
+                direction,
+                result["average"],
+                signal["stop"],
+                signal["target"],
+                result["filled_quantity"],
+                mode="AUTO",
+                source=self.settings.trading_env,
+                snapshot=signal.get("snapshot"),
+            )
+
+            log.info(
+                "ORDER FILLED | symbol=%s | order_id=%s | trade_id=%s | "
+                "average=%s | quantity=%s",
+                symbol,
+                result.get("order_id"),
+                trade_id,
+                result.get("average"),
+                result.get("filled_quantity"),
+            )
+
+            self.notify(
+                f"✅ TRADE OPENED\n"
+                f"{symbol} {direction}\n"
+                f"Order: {result.get('order_id', 'unknown')}\n"
+                f"Entry fill: {result['average']:.8g}\n"
+                f"SL: {signal['stop']:.8g}\n"
+                f"TP: {signal['target']:.8g}\n"
+                f"Trade ID: {trade_id}"
+            )
+            return
+
+        log.error(
+            "ORDER FAILED | symbol=%s | error=%s | reconcile_required=%s",
+            symbol,
+            result.get("error", "unknown"),
+            result.get("reconcile_required", False),
+        )
+
+        self.notify(
+            f"⚠️ EXECUTION FAILED\n"
+            f"{symbol}\n"
+            f"Error: {result.get('error', 'unknown')}\n"
+            f"Reconciliation required: "
+            f"{result.get('reconcile_required', False)}"
+        )
+
+    def scan_once(self, allow_auto=True):
+        symbols = self.db.enabled_symbols()
+        prices = {}
+        errors = 0
+
+        log.info(
+            "SCAN CYCLE START | symbols=%s | env=%s | mode=%s | "
+            "allow_auto=%s",
+            len(symbols),
+            self.settings.trading_env,
+            self.mode,
+            allow_auto,
+        )
+
+        for symbol in symbols:
+            try:
+                self._process_symbol(symbol, prices, allow_auto)
+            except Exception:
+                errors += 1
+                log.exception("SCAN FAILED | symbol=%s", symbol)
+
+        if self.settings.trading_env == "PAPER":
+            try:
+                closed_trades = self.paper.mark(prices)
+
+                for trade_id, reason, pnl in closed_trades:
+                    log.info(
+                        "PAPER TRADE CLOSED | trade_id=%s | reason=%s | pnl=%s",
+                        trade_id,
+                        reason,
+                        pnl,
+                    )
+                    self.notify(
+                        f"🔴 PAPER TRADE CLOSED\n"
+                        f"Trade #{trade_id}\n"
+                        f"{reason}\n"
+                        f"PnL: {pnl:.6f}"
+                    )
+            except Exception:
+                errors += 1
+                log.exception("PAPER POSITION MONITOR FAILED")
+
+        self.last_scan = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.last_result = (
+            f"Completed scan; symbols={len(symbols)}; errors={errors}"
+        )
+
+        log.info(
+            "SCAN CYCLE COMPLETE | symbols=%s | errors=%s | result=%s",
+            len(symbols),
+            errors,
+            self.last_result,
+        )
+
         return self.last_result
+
     def status_text(self):
-        equity = self.execution.equity() if self.settings.trading_env in {"DEMO", "LIVE"} else self.paper.capital
-        available = self.execution.available() if self.settings.trading_env in {"DEMO", "LIVE"} else self.paper.capital
-        armed = "YES" if (
-            (self.settings.trading_env == "DEMO" and self.settings.demo_armed)
-            or (self.settings.trading_env == "LIVE" and self.settings.live_armed)
-        ) else "NO"
+        if self.settings.trading_env == "PAPER":
+            equity = self.paper.capital
+            available = self.paper.capital
+        else:
+            equity = self.execution.equity()
+            available = self.execution.available()
+
+        if self.settings.trading_env == "DEMO":
+            armed = "YES" if self.settings.demo_armed else "NO"
+        elif self.settings.trading_env == "LIVE":
+            armed = "YES" if self.settings.live_armed else "NO"
+        else:
+            armed = "N/A (PAPER)"
+
+        can_execute, execute_reason = (
+            self.execution.can_execute()
+            if self.settings.trading_env != "PAPER"
+            else (False, "PAPER environment")
+        )
+
         return (
             f"🤖 Khtb Lab {self.settings.bot_version}\n\n"
             f"Exchange: {self.settings.exchange_name}\n"
             f"Environment: {self.settings.trading_env}\n"
-            f"Account: {self.settings.account_type} / {self.settings.product_category}\n"
-            f"Mode: {self.mode}\nProfile: {self.profile}\n"
-            f"Margin: {self.settings.margin_mode} | Position: {self.settings.position_mode}\n"
+            f"Account: {self.settings.account_type} / "
+            f"{self.settings.product_category}\n"
+            f"Mode: {self.mode}\n"
+            f"Profile: {self.profile}\n"
+            f"Margin: {self.settings.margin_mode} | "
+            f"Position: {self.settings.position_mode}\n"
             f"Execution Armed: {armed}\n"
-            f"Order Sending: {'ON' if self.settings.enable_exchange_orders else 'OFF'}\n"
+            f"Order Sending: "
+            f"{'ON' if self.settings.enable_exchange_orders else 'OFF'}\n"
+            f"Execution Gate: "
+            f"{'READY' if can_execute else execute_reason}\n"
+            f"AI Review: "
+            f"{'ON' if self.settings.enable_ai_review else 'OFF'}\n"
+            f"AI Model: {self.settings.gemini_model}\n"
+            f"Technical Threshold: {self.settings.ai_min_tech_score}\n"
             f"Symbols: {len(self.db.enabled_symbols())}\n"
             f"Open Trades: {len(self.db.open_trades())}\n"
             f"Equity: {equity if equity is not None else 0:.2f} USDT\n"
             f"Available: {available if available is not None else 0:.2f} USDT\n"
             f"Daily PnL: {self.db.daily_pnl():.4f}\n"
-            f"Last Scan: {self.last_scan}"
+            f"Last Scan: {self.last_scan}\n"
+            f"Last Result: {self.last_result}"
         )
-    def backtest_symbol(self,s):
-        s=self.market.validate_symbol(s);return run_backtest(self.market.candles(s,self.settings.timeframe_main,1000),self.market.candles(s,self.settings.timeframe_trend,1000),self.market.candles(s,self.settings.timeframe_context,1000))
-    def run(self,telegram=None):
-        self.telegram=telegram
-        log.info("Khtb Lab started | env=%s mode=%s exchange=%s",self.settings.trading_env,self.mode,self.settings.exchange_name)
+
+    def backtest_symbol(self, symbol):
+        symbol = self.market.validate_symbol(symbol)
+
+        return run_backtest(
+            self.market.candles(
+                symbol, self.settings.timeframe_main, 1000
+            ),
+            self.market.candles(
+                symbol, self.settings.timeframe_trend, 1000
+            ),
+            self.market.candles(
+                symbol, self.settings.timeframe_context, 1000
+            ),
+        )
+
+    def run(self, telegram=None):
+        self.telegram = telegram
+
+        log.info(
+            "KHTB LAB STARTED | env=%s | mode=%s | exchange=%s",
+            self.settings.trading_env,
+            self.mode,
+            self.settings.exchange_name,
+        )
+
         while True:
-            if telegram:telegram.poll_once()
-            self.scan_once(True)
-            time.sleep(max(5,self.settings.scan_seconds))
+            try:
+                if telegram:
+                    telegram.poll_once()
+            except Exception:
+                log.exception("TELEGRAM POLLING FAILED")
+
+            try:
+                self.scan_once(allow_auto=True)
+            except Exception:
+                log.exception("SCAN CYCLE FAILED")
+
+            time.sleep(max(5, self.settings.scan_seconds))
