@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -60,14 +59,12 @@ class KhtbLab:
 
     def get_prices(self, symbols):
         prices = {}
-
         for symbol in symbols:
             try:
                 ticker = self.market.ticker(symbol)
                 prices[symbol] = float(ticker.get("last") or 0)
             except Exception:
                 log.exception("TICKER FAILED | symbol=%s", symbol)
-
         return prices
 
     def notify(self, message):
@@ -129,8 +126,109 @@ class KhtbLab:
             result.get("status", "UNKNOWN"),
             result.get("confidence", 0),
         )
-
         return result
+
+    def _record_confirmed_fill(self, symbol, direction, signal, result):
+        """Persist an exchange-confirmed fill before reporting it to Telegram."""
+
+        average = float(result["average"])
+        filled_quantity = float(result["filled_quantity"])
+
+        if average <= 0 or filled_quantity <= 0:
+            raise ValueError(
+                "Cannot record a confirmed fill without positive "
+                "average price and filled quantity"
+            )
+
+        trade_id = self.db.open_trade(
+            symbol,
+            direction,
+            average,
+            signal["stop"],
+            signal["target"],
+            filled_quantity,
+            mode="AUTO",
+            source=self.settings.trading_env,
+            snapshot=signal.get("snapshot"),
+        )
+
+        log.info(
+            "EXCHANGE FILL RECORDED | symbol=%s | trade_id=%s | "
+            "order_id=%s | average=%s | quantity=%s",
+            symbol,
+            trade_id,
+            result.get("order_id"),
+            average,
+            filled_quantity,
+        )
+        return trade_id
+
+    def _notify_execution_result(self, symbol, direction, signal, result):
+        """Send truthful notifications about fills and protection status."""
+
+        protection = result.get("protection") or {}
+        protection_ok = protection.get("ok") is True
+
+        try:
+            trade_id = self._record_confirmed_fill(
+                symbol,
+                direction,
+                signal,
+                result,
+            )
+        except Exception:
+            log.exception(
+                "CRITICAL: EXCHANGE FILL COULD NOT BE RECORDED | "
+                "symbol=%s | order_id=%s",
+                symbol,
+                result.get("order_id"),
+            )
+            self.notify(
+                f"🚨 CRITICAL: EXCHANGE POSITION FILLED\n"
+                f"{symbol} {direction}\n"
+                f"Order: {result.get('order_id', 'unknown')}\n"
+                f"Average: {result.get('average', 'unknown')}\n"
+                f"Quantity: {result.get('filled_quantity', 'unknown')}\n"
+                f"Database recording failed. Check Bitget positions "
+                f"and the bot database immediately."
+            )
+            return
+
+        if protection_ok:
+            self.notify(
+                f"✅ TRADE FILLED — SL/TP CONFIRMED\n"
+                f"{symbol} {direction}\n"
+                f"Order: {result.get('order_id', 'unknown')}\n"
+                f"Entry fill: {result['average']:.8g}\n"
+                f"Filled quantity: {result['filled_quantity']:.8g}\n"
+                f"SL: {signal['stop']:.8g}\n"
+                f"TP: {signal['target']:.8g}\n"
+                f"Trade ID: {trade_id}\n"
+                f"Environment: {self.settings.trading_env}"
+            )
+            return
+
+        log.critical(
+            "POSITION OPEN; SL/TP UNCONFIRMED | symbol=%s | "
+            "order_id=%s | trade_id=%s | protection=%s",
+            symbol,
+            result.get("order_id"),
+            trade_id,
+            protection,
+        )
+
+        self.notify(
+            f"🚨 WARNING: POSITION OPEN — PROTECTION UNCONFIRMED\n"
+            f"{symbol} {direction}\n"
+            f"Order: {result.get('order_id', 'unknown')}\n"
+            f"Entry fill: {result['average']:.8g}\n"
+            f"Filled quantity: {result['filled_quantity']:.8g}\n"
+            f"Trade ID: {trade_id}\n"
+            f"SL confirmed: {protection.get('stop_confirmed', False)}\n"
+            f"TP confirmed: {protection.get('target_confirmed', False)}\n"
+            f"Check the open position and set/verify SL and TP "
+            f"on Bitget immediately. Do not assume it is protected."
+        )
 
     def _process_symbol(self, symbol, prices, allow_auto):
         log.info("SCAN START | symbol=%s", symbol)
@@ -158,7 +256,6 @@ class KhtbLab:
         direction = signal.get("direction", "NEUTRAL")
         score = float(signal.get("score", 0) or 0)
         entry = float(signal.get("price", 0) or 0)
-
         prices[symbol] = entry
 
         self.db.save_signal(
@@ -214,7 +311,6 @@ class KhtbLab:
         decision = str(ai.get("decision", "NOT_REVIEWED")).upper()
         ai_status = str(ai.get("status", "UNKNOWN")).upper()
 
-        # AI failure, disabled review, missing keys, and cooldown are not approval.
         if decision not in {"TAKE", "CONSIDER"} or ai_status != "OK":
             log.info(
                 "TRADE NOT APPROVED | symbol=%s | decision=%s | AI_status=%s",
@@ -235,8 +331,8 @@ class KhtbLab:
 
         if self.settings.trading_env == "LIVE":
             log.warning(
-                "LIVE ENVIRONMENT SELECTED | symbol=%s | execution remains "
-                "subject to all LIVE configuration gates",
+                "LIVE ENVIRONMENT SELECTED | symbol=%s | "
+                "execution subject to LIVE configuration gates",
                 symbol,
             )
 
@@ -244,7 +340,6 @@ class KhtbLab:
             capital = self.paper.capital
         else:
             can_execute, execute_reason = self.execution.can_execute()
-
             if not can_execute:
                 log.warning(
                     "EXECUTION GATE BLOCKED | symbol=%s | reason=%s",
@@ -252,7 +347,6 @@ class KhtbLab:
                     execute_reason,
                 )
                 return
-
             capital = self.execution.equity()
 
         if capital is None or capital <= 0:
@@ -326,7 +420,6 @@ class KhtbLab:
 
         if self.settings.trading_env == "PAPER":
             trade_id = self.paper.open(symbol, signal, "AUTO")
-
             if trade_id:
                 log.info(
                     "PAPER TRADE OPENED | symbol=%s | trade_id=%s",
@@ -393,53 +486,51 @@ class KhtbLab:
         result = self.execution.execute(plan)
 
         if result.get("success"):
-            trade_id = self.db.open_trade(
+            self._notify_execution_result(
                 symbol,
                 direction,
-                result["average"],
-                signal["stop"],
-                signal["target"],
-                result["filled_quantity"],
-                mode="AUTO",
-                source=self.settings.trading_env,
-                snapshot=signal.get("snapshot"),
-            )
-
-            log.info(
-                "ORDER FILLED | symbol=%s | order_id=%s | trade_id=%s | "
-                "average=%s | quantity=%s",
-                symbol,
-                result.get("order_id"),
-                trade_id,
-                result.get("average"),
-                result.get("filled_quantity"),
-            )
-
-            self.notify(
-                f"✅ TRADE OPENED\n"
-                f"{symbol} {direction}\n"
-                f"Order: {result.get('order_id', 'unknown')}\n"
-                f"Entry fill: {result['average']:.8g}\n"
-                f"SL: {signal['stop']:.8g}\n"
-                f"TP: {signal['target']:.8g}\n"
-                f"Trade ID: {trade_id}"
+                signal,
+                result,
             )
             return
 
+        # A partial fill or an uncertain order outcome may still represent
+        # exchange exposure. Do not claim no order was executed.
+        executed = bool(result.get("executed"))
+        reconcile_required = bool(result.get("reconcile_required"))
+        filled_quantity = float(result.get("filled_quantity") or 0)
+        average = float(result.get("average") or 0)
+
         log.error(
-            "ORDER FAILED | symbol=%s | error=%s | reconcile_required=%s",
+            "ORDER NOT CONFIRMED SUCCESSFUL | symbol=%s | error=%s | "
+            "executed=%s | filled_quantity=%s | reconcile_required=%s",
             symbol,
             result.get("error", "unknown"),
-            result.get("reconcile_required", False),
+            executed,
+            filled_quantity,
+            reconcile_required,
         )
 
-        self.notify(
-            f"⚠️ EXECUTION FAILED\n"
-            f"{symbol}\n"
-            f"Error: {result.get('error', 'unknown')}\n"
-            f"Reconciliation required: "
-            f"{result.get('reconcile_required', False)}"
-        )
+        if executed and filled_quantity > 0 and average > 0:
+            self.notify(
+                f"🚨 PARTIAL/UNCONFIRMED POSITION\n"
+                f"{symbol} {direction}\n"
+                f"Order: {result.get('order_id', 'unknown')}\n"
+                f"Reported filled quantity: {filled_quantity:.8g}\n"
+                f"Average price: {average:.8g}\n"
+                f"Status: {result.get('order_status', 'unknown')}\n"
+                f"Reconciliation required: {reconcile_required}\n"
+                f"Check Bitget orders and positions immediately. "
+                f"Do not assume the order is cancelled or protected."
+            )
+        else:
+            self.notify(
+                f"⚠️ ORDER NOT CONFIRMED\n"
+                f"{symbol}\n"
+                f"Error: {result.get('error', 'unknown')}\n"
+                f"Reconciliation required: {reconcile_required}\n"
+                f"Check Bitget order history before any manual retry."
+            )
 
     def scan_once(self, allow_auto=True):
         symbols = self.db.enabled_symbols()
@@ -465,7 +556,6 @@ class KhtbLab:
         if self.settings.trading_env == "PAPER":
             try:
                 closed_trades = self.paper.mark(prices)
-
                 for trade_id, reason, pnl in closed_trades:
                     log.info(
                         "PAPER TRADE CLOSED | trade_id=%s | reason=%s | pnl=%s",
@@ -494,7 +584,6 @@ class KhtbLab:
             errors,
             self.last_result,
         )
-
         return self.last_result
 
     def status_text(self):
