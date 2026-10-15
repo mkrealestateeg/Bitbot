@@ -1,26 +1,42 @@
 from __future__ import annotations
-import logging
+import json,logging,time
 log=logging.getLogger(__name__)
+class AIReviewer:
+    def __init__(self,settings):
+        self.settings=settings;self.keys=list(settings.gemini_api_pool);self.index=0;self.last={}
+    def review(self,symbol,signal):
+        if not self.settings.enable_ai_review or not self.keys:return None
+        now=time.time()
+        if now-self.last.get(symbol,0)<self.settings.ai_review_cooldown:return None
+        self.last[symbol]=now
+        key=self.keys[self.index%len(self.keys)];self.index+=1
+        try:
+            from google import genai
+            client=genai.Client(api_key=key)
+            prompt=f"""Review this already-qualified technical crypto opportunity. You are commentary only.
+Do not invent market data. Do not choose leverage or override risk controls. Return JSON only:
+{{"decision":"TAKE|IGNORE|CONSIDER","confidence":0-100,"comment":"max 300 chars"}}
+Symbol: {symbol}
+Direction: {signal.get("direction")}
+Technical score: {signal.get("score")}
+Setup: {signal.get("setup")}
+Entry: {signal.get("price")}
+Stop: {signal.get("stop")}
+Target: {signal.get("target")}
+Snapshot: {signal.get("snapshot")}
+Reason: {signal.get("reason")}"""
+            r=client.models.generate_content(model=self.settings.gemini_model,contents=prompt)
+            text=(getattr(r,"text",None) or "").strip()
+            try:
+                data=json.loads(text)
+            except Exception:
+                data={"decision":"CONSIDER","confidence":0,"comment":text[:300]}
+            data["decision"]=str(data.get("decision","CONSIDER")).upper()
+            data["confidence"]=float(data.get("confidence",0) or 0)
+            data["comment"]=str(data.get("comment",""))[:300]
+            return data
+        except Exception:
+            log.exception("Gemini opportunity review failed");return None
 
-def review_signal(settings, symbol: str, signal: dict) -> str | None:
-    """Optional commentary only. Never changes direction, levels, risk checks or execution."""
-    if not settings.enable_ai_review or not settings.gemini_api_key:
-        return None
-    try:
-        from google import genai
-        client=genai.Client(api_key=settings.gemini_api_key)
-        prompt=(
-            "You are a cautious crypto market reviewer. Do not give guarantees. "
-            "Do not change the supplied signal or invent data. In at most 60 words, "
-            "identify uncertainty or missing confirmation from this technical snapshot. "
-            "This is commentary only and must not instruct execution.\n"
-            f"Symbol: {symbol}\nSignal: {signal.get('direction')}\n"
-            f"Score: {signal.get('score')}\nSetup: {signal.get('setup')}\n"
-            f"Snapshot: {signal.get('snapshot')}\nReason: {signal.get('reason')}"
-        )
-        response=client.models.generate_content(model=settings.gemini_model,contents=prompt)
-        text=(getattr(response,'text',None) or '').strip()
-        return text[:1000] or None
-    except Exception:
-        log.exception('Optional Gemini review failed; technical signal remains unchanged')
-        return None
+def review_signal(settings,symbol,signal):
+    return AIReviewer(settings).review(symbol,signal)

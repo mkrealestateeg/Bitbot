@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import os
 from dataclasses import dataclass
@@ -8,9 +7,11 @@ load_dotenv()
 def _bool(name, default=False):
     v=os.getenv(name)
     return default if v is None else v.strip().lower() in {"1","true","yes","on"}
+
 def _float(name, default):
     try: return float(os.getenv(name,str(default)))
     except: return default
+
 def _int(name, default):
     try: return int(os.getenv(name,str(default)))
     except: return default
@@ -52,8 +53,12 @@ class Settings:
     enable_ai_review: bool=_bool("ENABLE_AI_REVIEW",False)
     gemini_api_pool: tuple[str,...]=tuple(x.strip() for x in os.getenv("GEMINI_API_POOL",os.getenv("GEMINI_API_KEY","")).split(",") if x.strip())
     gemini_model: str=os.getenv("GEMINI_MODEL","gemini-2.5-flash").strip()
+    ai_min_tech_score: float=_float("AI_MIN_TECH_SCORE",70.0)
     ai_review_cooldown: int=_int("AI_REVIEW_COOLDOWN",900)
-    bot_version: str="V3-UNIFIED-FINAL"
+    notify_technical_opportunity: bool=_bool("NOTIFY_TECHNICAL_OPPORTUNITY",True)
+    notify_auto_ready: bool=_bool("NOTIFY_AUTO_READY",True)
+    bot_version: str="V3.1-UNIFIED-FINAL"
+
     def validate(self):
         if self.trading_env not in {"PAPER","DEMO","LIVE"}: raise ValueError("TRADING_ENV must be PAPER, DEMO, or LIVE")
         if self.trading_mode not in {"MANUAL","AUTO"}: raise ValueError("TRADING_MODE must be MANUAL or AUTO")
@@ -61,4 +66,3 @@ class Settings:
         if not 0 < self.max_daily_loss <= .10: raise ValueError("MAX_DAILY_LOSS must be >0 and <=0.10")
         if self.max_open_positions<1: raise ValueError("MAX_OPEN_POSITIONS must be >=1")
         if self.leverage<1: raise ValueError("LEVERAGE must be >=1")
-        if self.trading_env=="LIVE" and not self.live_armed: pass
