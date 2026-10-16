@@ -127,7 +127,7 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
                 method,
                 url,
                 headers=headers,
-                json=body if method != "GET" else None,
+                data=body_text if method != "GET" else None,
                 timeout=self.settings.request_timeout,
             )
         except requests.RequestException:
