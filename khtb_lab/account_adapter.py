@@ -117,7 +117,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             "Content-Type": "application/json",
         }
 
-        # Bitget demo trading requires this header.
         if self.environment == "DEMO":
             headers["paptrading"] = "1"
 
@@ -137,8 +136,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
                 method,
                 path,
             )
-            # Do not retry order submissions here. The exchange may
-            # have received an order even if the client timed out.
             raise
 
         try:
@@ -177,6 +174,113 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
         return payload.get("data")
 
     # ---------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _number(value):
+        try:
+            result = float(value)
+
+            if result != float("inf") and result == result:
+                return result
+
+        except (TypeError, ValueError):
+            pass
+
+        return None
+
+    @staticmethod
+    def _safe_keys(value):
+        if isinstance(value, dict):
+            return list(value.keys())
+
+        if isinstance(value, list):
+            return [
+                f"list[{index}]"
+                for index in range(min(len(value), 5))
+            ]
+
+        return [type(value).__name__]
+
+    @staticmethod
+    def _find_usdt_asset(data):
+        """
+        Find the USDT asset regardless of whether Bitget returns
+        assets directly, nested under data, or in a list.
+        """
+
+        if isinstance(data, dict):
+            assets = data.get("assets")
+
+            if isinstance(assets, list):
+                for asset in assets:
+                    if not isinstance(asset, dict):
+                        continue
+
+                    if str(
+                        asset.get("coin", "")
+                    ).upper() == "USDT":
+                        return asset
+
+            # Some wrappers may return a single asset object.
+            if str(data.get("coin", "")).upper() == "USDT":
+                return data
+
+        elif isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+
+                if str(
+                    item.get("coin", "")
+                ).upper() == "USDT":
+                    return item
+
+                nested = item.get("assets")
+
+                if isinstance(nested, list):
+                    for asset in nested:
+                        if not isinstance(asset, dict):
+                            continue
+
+                        if str(
+                            asset.get("coin", "")
+                        ).upper() == "USDT":
+                            return asset
+
+        return {}
+
+    @staticmethod
+    def _account_object(data):
+        """
+        Normalize the account-assets response into the dictionary
+        containing account-level equity fields.
+        """
+
+        if isinstance(data, dict):
+            return data
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    if any(
+                        key in item
+                        for key in (
+                            "accountEquity",
+                            "usdtEquity",
+                            "effEquity",
+                            "assets",
+                        )
+                    ):
+                        return item
+
+            if data and isinstance(data[0], dict):
+                return data[0]
+
+        return {}
+
+    # ---------------------------------------------------------
     # Account balance and equity
     # ---------------------------------------------------------
 
@@ -186,56 +290,119 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             "/api/v3/account/assets",
         )
 
-        if not isinstance(data, dict):
+        if not isinstance(data, (dict, list)):
             raise RuntimeError(
-                "Unexpected Bitget account assets response"
+                "Unexpected Bitget account assets response: "
+                f"{type(data).__name__}"
             )
 
-        return data
+        account = self._account_object(data)
 
-    @staticmethod
-    def _number(value):
-        try:
-            result = float(value)
-            if result != float("inf") and result == result:
-                return result
-        except (TypeError, ValueError):
-            pass
-        return None
+        log.debug(
+            "BITGET UTA ASSETS RESPONSE | type=%s | account_keys=%s",
+            type(data).__name__,
+            self._safe_keys(account),
+        )
+
+        return data
 
     def get_equity(self):
         data = self.assets()
 
-        for key in ("usdtEquity", "accountEquity"):
-            value = self._number(data.get(key))
-            if value is not None and value > 0:
+        account = self._account_object(data)
+        usdt = self._find_usdt_asset(data)
+
+        # Official UTA account-level fields.
+        for key in (
+            "usdtEquity",
+            "accountEquity",
+            "effEquity",
+        ):
+            value = self._number(account.get(key))
+
+            if value is not None and value >= 0:
+                log.info(
+                    "BITGET EQUITY FOUND | field=%s | equity=%.8f",
+                    key,
+                    value,
+                )
                 return value
 
-        for asset in data.get("assets") or []:
-            if str(asset.get("coin", "")).upper() == "USDT":
-                for key in ("equity", "balance"):
-                    value = self._number(asset.get(key))
-                    if value is not None and value > 0:
-                        return value
+        # Fallback to the USDT asset itself.
+        for key in (
+            "equity",
+            "balance",
+            "balanceOriginal",
+            "available",
+        ):
+            value = self._number(usdt.get(key))
+
+            if value is not None and value >= 0:
+                log.info(
+                    "BITGET USDT EQUITY FOUND | field=%s | equity=%.8f",
+                    key,
+                    value,
+                )
+                return value
+
+        log.error(
+            "BITGET EQUITY PARSE FAILED | "
+            "response_type=%s | account_keys=%s | usdt_keys=%s",
+            type(data).__name__,
+            self._safe_keys(account),
+            self._safe_keys(usdt),
+        )
 
         raise RuntimeError(
-            "USDT equity not present in Bitget UTA response"
+            "USDT/account equity not present in Bitget UTA response"
         )
 
     def get_available(self):
         data = self.assets()
 
-        for asset in data.get("assets") or []:
-            if str(asset.get("coin", "")).upper() == "USDT":
-                for key in ("available", "equity", "balance"):
-                    value = self._number(asset.get(key))
-                    if value is not None and value >= 0:
-                        return value
+        account = self._account_object(data)
+        usdt = self._find_usdt_asset(data)
 
-        for key in ("usdtEquity", "accountEquity"):
-            value = self._number(data.get(key))
+        # USDT asset available balance is the preferred value.
+        for key in (
+            "available",
+            "equity",
+            "balance",
+            "balanceOriginal",
+        ):
+            value = self._number(usdt.get(key))
+
             if value is not None and value >= 0:
+                log.info(
+                    "BITGET AVAILABLE FOUND | field=%s | available=%.8f",
+                    key,
+                    value,
+                )
                 return value
+
+        # Account-level fallbacks.
+        for key in (
+            "usdtEquity",
+            "accountEquity",
+            "effEquity",
+        ):
+            value = self._number(account.get(key))
+
+            if value is not None and value >= 0:
+                log.info(
+                    "BITGET AVAILABLE FALLBACK | field=%s | available=%.8f",
+                    key,
+                    value,
+                )
+                return value
+
+        log.error(
+            "BITGET AVAILABLE PARSE FAILED | "
+            "response_type=%s | account_keys=%s | usdt_keys=%s",
+            type(data).__name__,
+            self._safe_keys(account),
+            self._safe_keys(usdt),
+        )
 
         raise RuntimeError(
             "USDT available balance not present in Bitget UTA response"
@@ -244,41 +411,47 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
     def state(self):
         data = self.assets()
 
-        usdt = next(
-            (
-                asset
-                for asset in data.get("assets") or []
-                if str(asset.get("coin", "")).upper() == "USDT"
-            ),
-            {},
+        account = self._account_object(data)
+        usdt = self._find_usdt_asset(data)
+
+        equity = (
+            self._number(account.get("usdtEquity"))
+            or self._number(account.get("accountEquity"))
+            or self._number(account.get("effEquity"))
+            or self._number(usdt.get("equity"))
+            or self._number(usdt.get("balance"))
+            or 0.0
+        )
+
+        available = (
+            self._number(usdt.get("available"))
+            if self._number(usdt.get("available")) is not None
+            else self._number(usdt.get("equity"))
+            if self._number(usdt.get("equity")) is not None
+            else self._number(usdt.get("balance"))
+            if self._number(usdt.get("balance")) is not None
+            else equity
         )
 
         return {
             "environment": self.environment,
             "account_type": "UTA",
             "currency": "USDT",
-            "equity": self._number(
-                data.get("usdtEquity")
-                or data.get("accountEquity")
-                or usdt.get("equity")
-            ) or 0.0,
-            "available": self._number(
-                usdt.get("available")
-                if usdt.get("available") is not None
-                else usdt.get("equity")
-                if usdt.get("equity") is not None
-                else usdt.get("balance")
-            ) or 0.0,
-            "unrealised_pnl": self._number(
-                data.get("usdtUnrealisedPnl")
-                or data.get("unrealisedPnl")
-            ) or 0.0,
-            "position_value": self._number(
-                data.get("positionValue")
-            ) or 0.0,
-            "leverage": self._number(
-                data.get("leverage")
-            ) or 0.0,
+            "equity": equity,
+            "available": available or 0.0,
+            "unrealised_pnl": (
+                self._number(account.get("usdtUnrealisedPnl"))
+                or self._number(account.get("unrealisedPnl"))
+                or 0.0
+            ),
+            "position_value": (
+                self._number(account.get("positionValue"))
+                or 0.0
+            ),
+            "leverage": (
+                self._number(account.get("leverage"))
+                or 0.0
+            ),
         }
 
     def account_settings(self):
@@ -295,21 +468,26 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
     # ---------------------------------------------------------
 
     def set_leverage(self, symbol: str, leverage: int):
-        """Set leverage and fail if the exchange rejects the request."""
-
         try:
             leverage_value = int(leverage)
         except (TypeError, ValueError) as exc:
-            raise ValueError("Leverage must be a positive integer") from exc
+            raise ValueError(
+                "Leverage must be a positive integer"
+            ) from exc
 
         if leverage_value < 1:
-            raise ValueError("Leverage must be at least 1")
+            raise ValueError(
+                "Leverage must be at least 1"
+            )
 
         margin_mode = str(
             self.settings.margin_mode
         ).lower()
 
-        if margin_mode not in ("isolated", "crossed"):
+        if margin_mode not in (
+            "isolated",
+            "crossed",
+        ):
             raise ValueError(
                 "Unsupported margin_mode: "
                 f"{self.settings.margin_mode!r}"
@@ -324,11 +502,12 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
         if margin_mode == "isolated":
             if self.settings.position_mode == "hedge":
-                # Hedge mode can require separate leverage requests
-                # for long and short positions.
                 results = {}
 
-                for pos_side in ("long", "short"):
+                for pos_side in (
+                    "long",
+                    "short",
+                ):
                     side_body = {
                         **body,
                         "posSide": pos_side,
@@ -342,7 +521,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
                 return results
 
-            # Isolated one-way mode.
             body["posSide"] = "long"
 
         return self._signed_request(
@@ -372,13 +550,21 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
         try:
             quantity = float(qty)
         except (TypeError, ValueError) as exc:
-            raise ValueError("Order quantity must be numeric") from exc
+            raise ValueError(
+                "Order quantity must be numeric"
+            ) from exc
 
         if quantity <= 0:
-            raise ValueError("Order quantity must be positive")
+            raise ValueError(
+                "Order quantity must be positive"
+            )
 
         side = str(side).lower()
-        if side not in ("buy", "sell"):
+
+        if side not in (
+            "buy",
+            "sell",
+        ):
             raise ValueError(
                 "Order side must be 'buy' or 'sell'"
             )
@@ -396,13 +582,18 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
         if self.settings.position_mode == "hedge":
             body["posSide"] = (
-                "long" if side == "buy" else "short"
+                "long"
+                if side == "buy"
+                else "short"
             )
 
         if target is not None:
             target_value = self._number(target)
+
             if target_value is None or target_value <= 0:
-                raise ValueError("Invalid take-profit price")
+                raise ValueError(
+                    "Invalid take-profit price"
+                )
 
             body.update({
                 "takeProfit": str(target),
@@ -412,8 +603,11 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
         if stop is not None:
             stop_value = self._number(stop)
+
             if stop_value is None or stop_value <= 0:
-                raise ValueError("Invalid stop-loss price")
+                raise ValueError(
+                    "Invalid stop-loss price"
+                )
 
             body.update({
                 "stopLoss": str(stop),
@@ -436,8 +630,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
         order_id=None,
         client_oid=None,
     ):
-        """Query a known order; never submit or resubmit an order here."""
-
         if not order_id and not client_oid:
             raise ValueError(
                 "Either order_id or client_oid is required"
@@ -503,7 +695,12 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
     @staticmethod
     def _symbol(symbol):
-        return str(symbol).split(":")[0].replace("/", "").upper()
+        return (
+            str(symbol)
+            .split(":")[0]
+            .replace("/", "")
+            .upper()
+        )
 
 
 class CCXTAccountAdapter(PlatformAccountAdapter):
@@ -517,11 +714,18 @@ class CCXTAccountAdapter(PlatformAccountAdapter):
         balance = self.exchange.fetch_balance()
         total = balance.get("total") or {}
 
-        for key in ("USDT", "usdt"):
+        for key in (
+            "USDT",
+            "usdt",
+        ):
             try:
-                value = float(total.get(key) or 0)
+                value = float(
+                    total.get(key) or 0
+                )
+
                 if value > 0:
                     return value
+
             except (TypeError, ValueError):
                 pass
 
@@ -531,11 +735,18 @@ class CCXTAccountAdapter(PlatformAccountAdapter):
         balance = self.exchange.fetch_balance()
         free = balance.get("free") or {}
 
-        for key in ("USDT", "usdt"):
+        for key in (
+            "USDT",
+            "usdt",
+        ):
             try:
-                value = float(free.get(key) or 0)
+                value = float(
+                    free.get(key) or 0
+                )
+
                 if value >= 0:
                     return value
+
             except (TypeError, ValueError):
                 pass
 
