@@ -498,62 +498,116 @@ def _process_symbol(self, symbol, prices, allow_auto):
         trade_id = self.paper.open(symbol, signal, "AUTO")
         if trade_id:
             log.info(
-                "PAPER TRADE OPENED | symbol=%s
+                "PAPER TRADE OPENED | symbol=%s | trade_id=%s",
+                symbol,
+                trade_id,
+            )
+            self.notify(
+                f"🟢 PAPER TRADE OPENED\n"
+                f"{symbol} {direction}\n"
+                f"Entry: {signal['price']:.8g}\n"
+                f"SL: {signal['stop']:.8g}\n"
+                f"TP: {signal['target']:.8g}"
+            )
+        else:
+            log.warning(
+                "PAPER TRADE NOT OPENED | symbol=%s",
+                symbol,
+            )
+        return
 
+    log.info(
+        "ORDER PREPARATION START | symbol=%s | quantity=%s | env=%s",
+        symbol,
+        quantity,
+        self.settings.trading_env,
+    )
 
-    def scan_once(self, allow_auto=True):
-        symbols = self.db.enabled_symbols()
-        prices = {}
-        errors = 0
+    plan = self.execution.prepare(
+        symbol,
+        direction,
+        quantity,
+        signal["price"],
+        signal["stop"],
+        signal["target"],
+    )
 
-        log.info(
-            "SCAN CYCLE START | symbols=%s | env=%s | mode=%s | "
-            "allow_auto=%s",
-            len(symbols),
-            self.settings.trading_env,
-            self.mode,
-            allow_auto,
+    if not plan.get("ready"):
+        log.warning(
+            "ORDER PREPARATION BLOCKED | symbol=%s | reason=%s",
+            symbol,
+            plan.get("error", "unknown"),
+        )
+        return
+
+    if self.settings.notify_auto_ready:
+        self.notify(
+            f"🟢 AUTO TRADE READY\n"
+            f"{symbol} {direction}\n"
+            f"Entry: {signal['price']:.8g}\n"
+            f"SL: {signal['stop']:.8g}\n"
+            f"TP: {signal['target']:.8g}\n"
+            f"Qty: {quantity:.8g}\n"
+            f"Environment: {self.settings.trading_env}\n"
+            f"Submitting order..."
         )
 
-        for symbol in symbols:
-            try:
-                self._process_symbol(symbol, prices, allow_auto)
-            except Exception:
-                errors += 1
-                log.exception("SCAN FAILED | symbol=%s", symbol)
+    log.info(
+        "ORDER SUBMISSION START | symbol=%s | direction=%s | quantity=%s",
+        symbol,
+        direction,
+        quantity,
+    )
 
-        if self.settings.trading_env == "PAPER":
-            try:
-                closed_trades = self.paper.mark(prices)
-                for trade_id, reason, pnl in closed_trades:
-                    log.info(
-                        "PAPER TRADE CLOSED | trade_id=%s | reason=%s | pnl=%s",
-                        trade_id,
-                        reason,
-                        pnl,
-                    )
-                    self.notify(
-                        f"🔴 PAPER TRADE CLOSED\n"
-                        f"Trade #{trade_id}\n"
-                        f"{reason}\n"
-                        f"PnL: {pnl:.6f}"
-                    )
-            except Exception:
-                errors += 1
-                log.exception("PAPER POSITION MONITOR FAILED")
+    result = self.execution.execute(plan)
 
-        self.last_scan = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.last_result = (
-            f"Completed scan; symbols={len(symbols)}; errors={errors}"
+    if result.get("success"):
+        self._notify_execution_result(
+            symbol,
+            direction,
+            signal,
+            result,
+        )
+        return
+
+    # A partial fill or an uncertain order outcome may still represent
+    # exchange exposure. Do not claim no order was executed.
+    executed = bool(result.get("executed"))
+    reconcile_required = bool(result.get("reconcile_required"))
+    filled_quantity = float(result.get("filled_quantity") or 0)
+    average = float(result.get("average") or 0)
+
+    log.error(
+        "ORDER NOT CONFIRMED SUCCESSFUL | symbol=%s | error=%s | "
+        "executed=%s | filled_quantity=%s | reconcile_required=%s",
+        symbol,
+        result.get("error", "unknown"),
+        executed,
+        filled_quantity,
+        reconcile_required,
+    )
+
+    if executed and filled_quantity > 0 and average > 0:
+        self.notify(
+            f"🚨 PARTIAL/UNCONFIRMED POSITION\n"
+            f"{symbol} {direction}\n"
+            f"Order: {result.get('order_id', 'unknown')}\n"
+            f"Reported filled quantity: {filled_quantity:.8g}\n"
+            f"Average price: {average:.8g}\n"
+            f"Status: {result.get('order_status', 'unknown')}\n"
+            f"Reconciliation required: {reconcile_required}\n"
+            f"Check Bitget orders and positions immediately. "
+            f"Do not assume the order is cancelled or protected."
+        )
+    else:
+        self.notify(
+            f"⚠️ ORDER NOT CONFIRMED\n"
+            f"{symbol}\n"
+            f"Error: {result.get('error', 'unknown')}\n"
+            f"Reconciliation required: {reconcile_required}\n"
+            f"Check Bitget order history before any manual retry."
         )
 
-        log.info(
-            "SCAN CYCLE COMPLETE | symbols=%s | errors=%s | result=%s",
-            len(symbols),
-            errors,
-            self.last_result,
-        )
-        return self.last_result
 
     def status_text(self):
         if self.settings.trading_env == "PAPER":
