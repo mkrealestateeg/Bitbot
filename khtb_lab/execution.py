@@ -339,335 +339,335 @@ class ExecutionEngine:
     # Execute order
     # ---------------------------------------------------------
 
-def execute(self, plan):
-    ok, why = self.can_execute()
+    def execute(self, plan):
+        ok, why = self.can_execute()
 
-    if not ok:
-        return {
-            "success": False,
-            "executed": False,
-            "error": why,
-            "reconcile_required": False,
-        }
-
-    if not isinstance(plan, dict) or not plan.get("ready"):
-        return {
-            "success": False,
-            "executed": False,
-            "error": "invalid_or_unready_plan",
-            "reconcile_required": False,
-        }
-
-    if str(plan.get("environment", "")).upper() != self.environment:
-        return {
-            "success": False,
-            "executed": False,
-            "error": "plan_environment_mismatch",
-            "reconcile_required": False,
-        }
-
-    symbol = plan["symbol"]
-    direction = plan["direction"]
-
-    if direction not in {"LONG", "SHORT"}:
-        return {
-            "success": False,
-            "executed": False,
-            "error": "invalid_direction",
-            "reconcile_required": False,
-        }
-
-    # FINAL LIVE-MARKET SANITY CHECK.
-    # This check runs immediately before any order submission.
-    try:
-        if self.exchange is None:
-            raise RuntimeError("Market exchange client is unavailable")
-
-        ticker = self.exchange.fetch_ticker(symbol)
-        live_price = self._as_float(ticker.get("last"))
-
-        entry = self._as_float(plan.get("entry"))
-        stop = self._as_float(plan.get("stop"))
-        target = self._as_float(plan.get("target"))
-
-        if min(live_price, entry, stop, target) <= 0:
-            raise ValueError(
-                "Live price, entry, SL and TP must all be positive"
-            )
-
-        # _as_float rejects NaN and positive infinity; explicitly
-        # reject negative infinity as well.
-        values = (live_price, entry, stop, target)
-        if any(
-            value != value or abs(value) == float("inf")
-            for value in values
-        ):
-            raise ValueError("Non-finite live price or order level")
-
-        max_deviation_pct = float(
-            self.settings.max_entry_deviation_pct
-        )
-
-        if max_deviation_pct < 0:
-            raise ValueError(
-                "MAX_ENTRY_DEVIATION_PCT must not be negative"
-            )
-
-        deviation_pct = abs(live_price - entry) / entry * 100
-
-        if deviation_pct > max_deviation_pct:
+        if not ok:
             return {
                 "success": False,
                 "executed": False,
-                "error": (
-                    "live_price_deviation_exceeded:"
-                    f"{deviation_pct:.4f}%>"
-                    f"{max_deviation_pct:.4f}%"
-                ),
+                "error": why,
                 "reconcile_required": False,
             }
 
-        if direction == "LONG":
-            if not stop < live_price < target:
-                raise ValueError(
-                    "LONG blocked: live price is at/beyond SL or TP"
-                )
+        if not isinstance(plan, dict) or not plan.get("ready"):
+            return {
+                "success": False,
+                "executed": False,
+                "error": "invalid_or_unready_plan",
+                "reconcile_required": False,
+            }
 
-        elif direction == "SHORT":
-            if not target < live_price < stop:
-                raise ValueError(
-                    "SHORT blocked: live price is at/beyond TP or SL"
-                )
+        if str(plan.get("environment", "")).upper() != self.environment:
+            return {
+                "success": False,
+                "executed": False,
+                "error": "plan_environment_mismatch",
+                "reconcile_required": False,
+            }
 
-        log.info(
-            "FINAL MARKET CHECK PASSED | symbol=%s | "
-            "direction=%s | planned_entry=%s | live_price=%s | "
-            "deviation_pct=%.4f | SL=%s | TP=%s",
-            symbol,
-            direction,
-            entry,
-            live_price,
-            deviation_pct,
-            stop,
-            target,
-        )
+        symbol = plan["symbol"]
+        direction = plan["direction"]
 
-    except Exception as exc:
-        log.warning(
-            "FINAL MARKET CHECK BLOCKED | symbol=%s | error=%s",
-            symbol,
-            exc,
-        )
-        return {
-            "success": False,
-            "executed": False,
-            "error": f"final_market_sanity_check_failed:{exc}",
-            "reconcile_required": False,
-        }
+        if direction not in {"LONG", "SHORT"}:
+            return {
+                "success": False,
+                "executed": False,
+                "error": "invalid_direction",
+                "reconcile_required": False,
+            }
 
-    try:
-        qty = self._precision_quantity(
-            symbol,
-            float(plan["quantity"]),
-        )
-    except Exception as exc:
-        log.exception("Quantity precision conversion failed")
-        return {
-            "success": False,
-            "executed": False,
-            "error": f"quantity_precision_error:{exc}",
-            "reconcile_required": False,
-        }
-
-    if qty <= 0:
-        return {
-            "success": False,
-            "executed": False,
-            "error": "quantity rounded to zero",
-            "reconcile_required": False,
-        }
-
-    side = "buy" if direction == "LONG" else "sell"
-    client_oid = "khtb-" + uuid.uuid4().hex[:20]
-
-    # Fail closed: do not submit an order if leverage setup fails.
-    try:
-        leverage_result = self.account.set_leverage(
-            symbol,
-            self.settings.leverage,
-        )
-
-        log.info(
-            "LEVERAGE REQUEST ACCEPTED | symbol=%s | leverage=%s",
-            symbol,
-            self.settings.leverage,
-        )
-
-    except Exception as exc:
-        log.exception(
-            "LEVERAGE SETUP FAILED; ORDER BLOCKED | symbol=%s",
-            symbol,
-        )
-
-        return {
-            "success": False,
-            "executed": False,
-            "error": f"leverage_setup_failed:{type(exc).__name__}:{exc}",
-            "reconcile_required": False,
-        }
-
-    # Never automatically retry place_order after a timeout.
-    # The exchange might already have accepted the order.
-    ack = None
-    submission_error = None
-
-    try:
-        ack = self.account.place_order(
-            symbol,
-            side,
-            qty,
-            client_oid,
-            stop=plan["stop"],
-            target=plan["target"],
-        )
-
-    except Exception as exc:
-        submission_error = f"{type(exc).__name__}:{exc}"
-
-        log.exception(
-            "ORDER SUBMISSION RESULT UNKNOWN; "
-            "RECONCILING BY CLIENT OID | symbol=%s | client_oid=%s",
-            symbol,
-            client_oid,
-        )
-
-    order_id = self._extract_order_id(ack)
-
-    if not order_id and not submission_error:
-        log.warning(
-            "ORDER ACK HAS NO ORDER ID; RECONCILING | "
-            "symbol=%s | client_oid=%s",
-            symbol,
-            client_oid,
-        )
-
-    # Query by clientOid when order ID is missing or submission
-    # raised an exception. Do not submit a second order.
-    if submission_error or not order_id:
+        # FINAL LIVE-MARKET SANITY CHECK.
+        # This check runs immediately before any order submission.
         try:
-            order_id, info = self._reconcile_order(
+            if self.exchange is None:
+                raise RuntimeError("Market exchange client is unavailable")
+
+            ticker = self.exchange.fetch_ticker(symbol)
+            live_price = self._as_float(ticker.get("last"))
+
+            entry = self._as_float(plan.get("entry"))
+            stop = self._as_float(plan.get("stop"))
+            target = self._as_float(plan.get("target"))
+
+            if min(live_price, entry, stop, target) <= 0:
+                raise ValueError(
+                    "Live price, entry, SL and TP must all be positive"
+                )
+
+            # _as_float rejects NaN and positive infinity; explicitly
+            # reject negative infinity as well.
+            values = (live_price, entry, stop, target)
+            if any(
+                value != value or abs(value) == float("inf")
+                for value in values
+            ):
+                raise ValueError("Non-finite live price or order level")
+
+            max_deviation_pct = float(
+                self.settings.max_entry_deviation_pct
+            )
+
+            if max_deviation_pct < 0:
+                raise ValueError(
+                    "MAX_ENTRY_DEVIATION_PCT must not be negative"
+                )
+
+            deviation_pct = abs(live_price - entry) / entry * 100
+
+            if deviation_pct > max_deviation_pct:
+                return {
+                    "success": False,
+                    "executed": False,
+                    "error": (
+                        "live_price_deviation_exceeded:"
+                        f"{deviation_pct:.4f}%>"
+                        f"{max_deviation_pct:.4f}%"
+                    ),
+                    "reconcile_required": False,
+                }
+
+            if direction == "LONG":
+                if not stop < live_price < target:
+                    raise ValueError(
+                        "LONG blocked: live price is at/beyond SL or TP"
+                    )
+
+            elif direction == "SHORT":
+                if not target < live_price < stop:
+                    raise ValueError(
+                        "SHORT blocked: live price is at/beyond TP or SL"
+                    )
+
+            log.info(
+                "FINAL MARKET CHECK PASSED | symbol=%s | "
+                "direction=%s | planned_entry=%s | live_price=%s | "
+                "deviation_pct=%.4f | SL=%s | TP=%s",
+                symbol,
+                direction,
+                entry,
+                live_price,
+                deviation_pct,
+                stop,
+                target,
+            )
+
+        except Exception as exc:
+            log.warning(
+                "FINAL MARKET CHECK BLOCKED | symbol=%s | error=%s",
+                symbol,
+                exc,
+            )
+            return {
+                "success": False,
+                "executed": False,
+                "error": f"final_market_sanity_check_failed:{exc}",
+                "reconcile_required": False,
+            }
+
+        try:
+            qty = self._precision_quantity(
+                symbol,
+                float(plan["quantity"]),
+            )
+        except Exception as exc:
+            log.exception("Quantity precision conversion failed")
+            return {
+                "success": False,
+                "executed": False,
+                "error": f"quantity_precision_error:{exc}",
+                "reconcile_required": False,
+            }
+
+        if qty <= 0:
+            return {
+                "success": False,
+                "executed": False,
+                "error": "quantity rounded to zero",
+                "reconcile_required": False,
+            }
+
+        side = "buy" if direction == "LONG" else "sell"
+        client_oid = "khtb-" + uuid.uuid4().hex[:20]
+
+        # Fail closed: do not submit an order if leverage setup fails.
+        try:
+            leverage_result = self.account.set_leverage(
+                symbol,
+                self.settings.leverage,
+            )
+
+            log.info(
+                "LEVERAGE REQUEST ACCEPTED | symbol=%s | leverage=%s",
+                symbol,
+                self.settings.leverage,
+            )
+
+        except Exception as exc:
+            log.exception(
+                "LEVERAGE SETUP FAILED; ORDER BLOCKED | symbol=%s",
+                symbol,
+            )
+
+            return {
+                "success": False,
+                "executed": False,
+                "error": f"leverage_setup_failed:{type(exc).__name__}:{exc}",
+                "reconcile_required": False,
+            }
+
+        # Never automatically retry place_order after a timeout.
+        # The exchange might already have accepted the order.
+        ack = None
+        submission_error = None
+
+        try:
+            ack = self.account.place_order(
+                symbol,
+                side,
+                qty,
+                client_oid,
+                stop=plan["stop"],
+                target=plan["target"],
+            )
+
+        except Exception as exc:
+            submission_error = f"{type(exc).__name__}:{exc}"
+
+            log.exception(
+                "ORDER SUBMISSION RESULT UNKNOWN; "
+                "RECONCILING BY CLIENT OID | symbol=%s | client_oid=%s",
+                symbol,
+                client_oid,
+            )
+
+        order_id = self._extract_order_id(ack)
+
+        if not order_id and not submission_error:
+            log.warning(
+                "ORDER ACK HAS NO ORDER ID; RECONCILING | "
+                "symbol=%s | client_oid=%s",
+                symbol,
+                client_oid,
+            )
+
+        # Query by clientOid when order ID is missing or submission
+        # raised an exception. Do not submit a second order.
+        if submission_error or not order_id:
+            try:
+                order_id, info = self._reconcile_order(
+                    symbol,
+                    order_id,
+                    client_oid,
+                    seconds=12,
+                )
+            except Exception:
+                info = {}
+                log.exception(
+                    "ORDER RECONCILIATION FAILED | symbol=%s",
+                    symbol,
+                )
+
+            if not info:
+                return {
+                    "success": False,
+                    "executed": False,
+                    "order_id": order_id or None,
+                    "client_oid": client_oid,
+                    "error": (
+                        "submission_outcome_unknown; "
+                        "no automatic resubmission attempted"
+                    ),
+                    "submission_error": submission_error,
+                    "reconcile_required": True,
+                }
+
+        else:
+            info = {}
+
+        # Poll order status when the order ID is known.
+        if order_id:
+            order_id, polled_info = self._reconcile_order(
                 symbol,
                 order_id,
                 client_oid,
                 seconds=12,
             )
-        except Exception:
-            info = {}
-            log.exception(
-                "ORDER RECONCILIATION FAILED | symbol=%s",
-                symbol,
-            )
 
-        if not info:
+            if polled_info:
+                info = polled_info
+
+        status = str(
+            info.get("orderStatus") or ""
+        ).lower()
+
+        filled = self._as_float(info.get("cumExecQty"))
+        average = self._as_float(info.get("avgPrice"))
+
+        if status in self.TERMINAL_FAILED:
             return {
                 "success": False,
-                "executed": False,
+                "executed": filled > 0,
                 "order_id": order_id or None,
                 "client_oid": client_oid,
+                "filled_quantity": filled,
+                "order_status": status,
+                "error": f"exchange_order_{status}",
+                "reconcile_required": filled > 0,
+            }
+
+        if status != "filled" or filled <= 0 or average <= 0:
+            return {
+                "success": False,
+                "executed": filled > 0,
+                "order_id": order_id or None,
+                "client_oid": client_oid,
+                "average": average or None,
+                "filled_quantity": filled,
+                "order_status": status or "unknown",
                 "error": (
-                    "submission_outcome_unknown; "
-                    "no automatic resubmission attempted"
+                    "order_not_confirmed_filled; "
+                    "manual or automated reconciliation is required"
                 ),
-                "submission_error": submission_error,
                 "reconcile_required": True,
             }
 
-    else:
-        info = {}
-
-    # Poll order status when the order ID is known.
-    if order_id:
-        order_id, polled_info = self._reconcile_order(
-            symbol,
-            order_id,
-            client_oid,
-            seconds=12,
+        protection = self._protection_status(
+            info,
+            plan["stop"],
+            plan["target"],
         )
 
-        if polled_info:
-            info = polled_info
+        if not protection["ok"]:
+            log.critical(
+                "POSITION FILLED BUT SL/TP NOT CONFIRMED | "
+                "symbol=%s | order_id=%s | protection=%s",
+                symbol,
+                order_id,
+                protection,
+            )
 
-    status = str(
-        info.get("orderStatus") or ""
-    ).lower()
-
-    filled = self._as_float(info.get("cumExecQty"))
-    average = self._as_float(info.get("avgPrice"))
-
-    if status in self.TERMINAL_FAILED:
         return {
-            "success": False,
-            "executed": filled > 0,
-            "order_id": order_id or None,
+            # A confirmed fill is a real position even if protection
+            # is unverified. Keep success=True so callers can record it.
+            "success": True,
+            "executed": True,
+            "order_id": order_id,
             "client_oid": client_oid,
+            "average": average,
             "filled_quantity": filled,
             "order_status": status,
-            "error": f"exchange_order_{status}",
-            "reconcile_required": filled > 0,
-        }
-
-    if status != "filled" or filled <= 0 or average <= 0:
-        return {
-            "success": False,
-            "executed": filled > 0,
-            "order_id": order_id or None,
-            "client_oid": client_oid,
-            "average": average or None,
-            "filled_quantity": filled,
-            "order_status": status or "unknown",
-            "error": (
-                "order_not_confirmed_filled; "
-                "manual or automated reconciliation is required"
+            "environment": self.environment,
+            "leverage_result": leverage_result,
+            "protection": protection,
+            "warning": (
+                None
+                if protection["ok"]
+                else "POSITION FILLED; SL/TP MUST BE CHECKED IMMEDIATELY"
             ),
-            "reconcile_required": True,
+            "reconcile_required": not protection["ok"],
         }
-
-    protection = self._protection_status(
-        info,
-        plan["stop"],
-        plan["target"],
-    )
-
-    if not protection["ok"]:
-        log.critical(
-            "POSITION FILLED BUT SL/TP NOT CONFIRMED | "
-            "symbol=%s | order_id=%s | protection=%s",
-            symbol,
-            order_id,
-            protection,
-        )
-
-    return {
-        # A confirmed fill is a real position even if protection
-        # is unverified. Keep success=True so callers can record it.
-        "success": True,
-        "executed": True,
-        "order_id": order_id,
-        "client_oid": client_oid,
-        "average": average,
-        "filled_quantity": filled,
-        "order_status": status,
-        "environment": self.environment,
-        "leverage_result": leverage_result,
-        "protection": protection,
-        "warning": (
-            None
-            if protection["ok"]
-            else "POSITION FILLED; SL/TP MUST BE CHECKED IMMEDIATELY"
-        ),
-        "reconcile_required": not protection["ok"],
-    }
-    # ---------------------------------------------------------
+        # ---------------------------------------------------------
     # Close positions
     # ---------------------------------------------------------
 

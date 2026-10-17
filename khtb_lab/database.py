@@ -42,3 +42,5 @@ class Database:
         if not rows:return {"closed":0,"win_rate":0.0,"pnl":0.0,"avg_r":0.0,"profit_factor":0.0}
         pnls=[float(r["pnl"] or 0) for r in rows];wins=[p for p in pnls if p>0];losses=[p for p in pnls if p<0]
         return {"closed":len(rows),"win_rate":len(wins)/len(rows)*100,"pnl":sum(pnls),"avg_r":sum(float(r["r_multiple"] or 0) for r in rows)/len(rows),"profit_factor":sum(wins)/abs(sum(losses)) if losses else(999.0 if wins else 0.0)}
+    def close(self):
+        self.conn.close()
