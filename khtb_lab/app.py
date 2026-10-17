@@ -230,307 +230,276 @@ class KhtbLab:
             f"on Bitget immediately. Do not assume it is protected."
         )
 
-    def _process_symbol(self, symbol, prices, allow_auto):
-        log.info("SCAN START | symbol=%s", symbol)
+def _process_symbol(self, symbol, prices, allow_auto):
+    log.info("SCAN START | symbol=%s", symbol)
 
-        main_frame = self.market.candles(
-            symbol, self.settings.timeframe_main, 250
-        )
-        trend_frame = self.market.candles(
-            symbol, self.settings.timeframe_trend, 250
-        )
-        context_frame = self.market.candles(
-            symbol, self.settings.timeframe_context, 250
-        )
+    main_frame = self.market.candles(
+        symbol, self.settings.timeframe_main, 250
+    )
+    trend_frame = self.market.candles(
+        symbol, self.settings.timeframe_trend, 250
+    )
+    context_frame = self.market.candles(
+        symbol, self.settings.timeframe_context, 250
+    )
 
-        log.info(
-            "MARKET DATA READY | symbol=%s | main=%s | trend=%s | context=%s",
-            symbol,
-            len(main_frame),
-            len(trend_frame),
-            len(context_frame),
-        )
+    log.info(
+        "MARKET DATA READY | symbol=%s | main=%s | trend=%s | context=%s",
+        symbol,
+        len(main_frame),
+        len(trend_frame),
+        len(context_frame),
+    )
 
-        signal = analyze(main_frame, trend_frame, context_frame)
+    signal = analyze(main_frame, trend_frame, context_frame)
 
-        direction = signal.get("direction", "NEUTRAL")
-        score = float(signal.get("score", 0) or 0)
-        entry = float(signal.get("price", 0) or 0)
-        prices[symbol] = entry
+    direction = str(signal.get("direction", "NEUTRAL")).upper()
+    score = float(signal.get("score", 0) or 0)
+    threshold = float(self.settings.ai_min_tech_score)
 
-        self.db.save_signal(
-            symbol,
-            direction,
-            entry,
-            score,
-            signal.get("setup", ""),
-            signal.get("reason", ""),
-            signal.get("snapshot", {}),
-        )
+    entry = float(signal.get("price", 0) or 0)
 
-        log.info(
-            "EVALUATION COMPLETE | symbol=%s | direction=%s | score=%.1f | "
-            "setup=%s | entry=%s",
-            symbol,
-            direction,
-            score,
-            signal.get("setup", ""),
-            entry,
-        )
+    # Refresh the entry only for a directional signal that passes
+    # the technical threshold, avoiding unnecessary ticker requests.
+    if direction in {"LONG", "SHORT"} and score >= threshold:
+        try:
+            original_entry = float(signal.get("price", 0) or 0)
+            original_stop = float(signal.get("stop", 0) or 0)
+            original_target = float(signal.get("target", 0) or 0)
 
-        threshold = float(self.settings.ai_min_tech_score)
+            if min(original_entry, original_stop, original_target) <= 0:
+                raise ValueError("Original entry/SL/TP must be positive")
 
-        if direction not in {"LONG", "SHORT"}:
-            log.info(
-                "EVALUATION FILTER | symbol=%s | reason=no_directional_signal",
-                symbol,
-            )
-            return
+            if direction == "LONG" and not (
+                original_stop < original_entry < original_target
+            ):
+                raise ValueError("Original LONG levels are invalid")
 
-        if score < threshold:
-            log.info(
-                "EVALUATION FILTER | symbol=%s | score=%.1f | threshold=%.1f",
-                symbol,
-                score,
-                threshold,
-            )
-            return
+            if direction == "SHORT" and not (
+                original_target < original_entry < original_stop
+            ):
+                raise ValueError("Original SHORT levels are invalid")
 
-        log.info(
-            "OPPORTUNITY QUALIFIED | symbol=%s | direction=%s | score=%.1f",
-            symbol,
-            direction,
-            score,
-        )
+            ticker = self.market.ticker(symbol)
+            live_price = float(ticker.get("last") or 0)
 
-        ai = self._review_ai(symbol, signal)
+            if live_price <= 0 or live_price == float("inf"):
+                raise ValueError("Live ticker price is invalid")
 
-        if self.settings.notify_technical_opportunity:
-            self.notify(self.opportunity_text(symbol, signal, ai))
+            # Move the planned entry to the current market price while
+            # preserving the original absolute SL/TP distances.
+            shift = live_price - original_entry
 
-        decision = str(ai.get("decision", "NOT_REVIEWED")).upper()
-        ai_status = str(ai.get("status", "UNKNOWN")).upper()
+            new_stop = original_stop + shift
+            new_target = original_target + shift
 
-        if decision not in {"TAKE", "CONSIDER"} or ai_status != "OK":
-            log.info(
-                "TRADE NOT APPROVED | symbol=%s | decision=%s | AI_status=%s",
-                symbol,
-                decision,
-                ai_status,
-            )
-            return
-
-        if not allow_auto or self.mode != "AUTO":
-            log.info(
-                "NO AUTOMATIC ORDER | symbol=%s | allow_auto=%s | mode=%s",
-                symbol,
-                allow_auto,
-                self.mode,
-            )
-            return
-
-        if self.settings.trading_env == "LIVE":
-            log.warning(
-                "LIVE ENVIRONMENT SELECTED | symbol=%s | "
-                "execution subject to LIVE configuration gates",
-                symbol,
-            )
-
-        if self.settings.trading_env == "PAPER":
-            capital = self.paper.capital
-        else:
-            can_execute, execute_reason = self.execution.can_execute()
-            if not can_execute:
-                log.warning(
-                    "EXECUTION GATE BLOCKED | symbol=%s | reason=%s",
-                    symbol,
-                    execute_reason,
+            if direction == "LONG" and not (
+                0 < new_stop < live_price < new_target
+            ):
+                raise ValueError(
+                    "Rebased LONG levels are invalid at live price"
                 )
-                return
-            capital = self.execution.equity()
 
-        if capital is None or capital <= 0:
-            log.warning(
-                "RISK BLOCK | symbol=%s | reason=equity_unavailable",
-                symbol,
-            )
-            if self.mode == "AUTO":
-                self.notify(
-                    f"⚠️ {symbol} BLOCKED\n"
-                    f"Account equity unavailable. No order was sent."
+            if direction == "SHORT" and not (
+                0 < new_target < live_price < new_stop
+            ):
+                raise ValueError(
+                    "Rebased SHORT levels are invalid at live price"
                 )
-            return
 
-        ok, reason = risk_check(
-            self.settings,
-            self.db,
-            signal,
-            capital,
-        )
+            signal["price"] = live_price
+            signal["stop"] = new_stop
+            signal["target"] = new_target
+            entry = live_price
+            prices[symbol] = live_price
 
-        if not ok:
-            log.warning(
-                "RISK BLOCK | symbol=%s | reason=%s",
-                symbol,
-                reason,
-            )
-            return
-
-        log.info(
-            "RISK CHECK PASSED | symbol=%s | capital=%.4f",
-            symbol,
-            capital,
-        )
-
-        if any(
-            trade["symbol"] == symbol
-            for trade in self.db.open_trades()
-        ):
             log.info(
-                "ORDER SKIPPED | symbol=%s | reason=position_already_open",
-                symbol,
-            )
-            return
-
-        risk_fraction = self.settings.risk_per_trade * (
-            0.5 if self.profile == "SAFE" else 1
-        )
-
-        quantity = position_size(
-            capital,
-            signal["price"],
-            signal["stop"],
-            risk_fraction,
-        )
-
-        if self.settings.trading_env != "PAPER":
-            max_quantity_by_margin = (
-                self.settings.max_margin_per_trade
-                * self.settings.leverage
-                / max(signal["price"], 1e-12)
-            )
-            quantity = min(quantity, max_quantity_by_margin)
-
-        if quantity <= 0:
-            log.warning(
-                "ORDER BLOCKED | symbol=%s | reason=quantity_not_positive",
-                symbol,
-            )
-            return
-
-        if self.settings.trading_env == "PAPER":
-            trade_id = self.paper.open(symbol, signal, "AUTO")
-            if trade_id:
-                log.info(
-                    "PAPER TRADE OPENED | symbol=%s | trade_id=%s",
-                    symbol,
-                    trade_id,
-                )
-                self.notify(
-                    f"🟢 PAPER TRADE OPENED\n"
-                    f"{symbol} {direction}\n"
-                    f"Entry: {signal['price']:.8g}\n"
-                    f"SL: {signal['stop']:.8g}\n"
-                    f"TP: {signal['target']:.8g}"
-                )
-            else:
-                log.warning(
-                    "PAPER TRADE NOT OPENED | symbol=%s",
-                    symbol,
-                )
-            return
-
-        log.info(
-            "ORDER PREPARATION START | symbol=%s | quantity=%s | env=%s",
-            symbol,
-            quantity,
-            self.settings.trading_env,
-        )
-
-        plan = self.execution.prepare(
-            symbol,
-            direction,
-            quantity,
-            signal["price"],
-            signal["stop"],
-            signal["target"],
-        )
-
-        if not plan.get("ready"):
-            log.warning(
-                "ORDER PREPARATION BLOCKED | symbol=%s | reason=%s",
-                symbol,
-                plan.get("error", "unknown"),
-            )
-            return
-
-        if self.settings.notify_auto_ready:
-            self.notify(
-                f"🟢 AUTO TRADE READY\n"
-                f"{symbol} {direction}\n"
-                f"Entry: {signal['price']:.8g}\n"
-                f"SL: {signal['stop']:.8g}\n"
-                f"TP: {signal['target']:.8g}\n"
-                f"Qty: {quantity:.8g}\n"
-                f"Environment: {self.settings.trading_env}\n"
-                f"Submitting order..."
-            )
-
-        log.info(
-            "ORDER SUBMISSION START | symbol=%s | direction=%s | quantity=%s",
-            symbol,
-            direction,
-            quantity,
-        )
-
-        result = self.execution.execute(plan)
-
-        if result.get("success"):
-            self._notify_execution_result(
+                "LIVE ENTRY REFRESHED | symbol=%s | direction=%s | "
+                "old_entry=%s | live_entry=%s | SL=%s | TP=%s",
                 symbol,
                 direction,
-                signal,
-                result,
+                original_entry,
+                live_price,
+                new_stop,
+                new_target,
+            )
+
+        except Exception as exc:
+            log.warning(
+                "SIGNAL BLOCKED | symbol=%s | "
+                "reason=live_price_or_levels_invalid | error=%s",
+                symbol,
+                exc,
             )
             return
+    else:
+        # Keep the analyzed candle price for non-qualified signals.
+        prices[symbol] = entry
 
-        # A partial fill or an uncertain order outcome may still represent
-        # exchange exposure. Do not claim no order was executed.
-        executed = bool(result.get("executed"))
-        reconcile_required = bool(result.get("reconcile_required"))
-        filled_quantity = float(result.get("filled_quantity") or 0)
-        average = float(result.get("average") or 0)
+    self.db.save_signal(
+        symbol,
+        direction,
+        entry,
+        score,
+        signal.get("setup", ""),
+        signal.get("reason", ""),
+        signal.get("snapshot", {}),
+    )
 
-        log.error(
-            "ORDER NOT CONFIRMED SUCCESSFUL | symbol=%s | error=%s | "
-            "executed=%s | filled_quantity=%s | reconcile_required=%s",
+    log.info(
+        "EVALUATION COMPLETE | symbol=%s | direction=%s | score=%.1f | "
+        "setup=%s | entry=%s",
+        symbol,
+        direction,
+        score,
+        signal.get("setup", ""),
+        entry,
+    )
+
+    if direction not in {"LONG", "SHORT"}:
+        log.info(
+            "EVALUATION FILTER | symbol=%s | reason=no_directional_signal",
             symbol,
-            result.get("error", "unknown"),
-            executed,
-            filled_quantity,
-            reconcile_required,
+        )
+        return
+
+    if score < threshold:
+        log.info(
+            "EVALUATION FILTER | symbol=%s | score=%.1f | threshold=%.1f",
+            symbol,
+            score,
+            threshold,
+        )
+        return
+
+    log.info(
+        "OPPORTUNITY QUALIFIED | symbol=%s | direction=%s | score=%.1f",
+        symbol,
+        direction,
+        score,
+    )
+
+    ai = self._review_ai(symbol, signal)
+
+    if self.settings.notify_technical_opportunity:
+        self.notify(self.opportunity_text(symbol, signal, ai))
+
+    decision = str(ai.get("decision", "NOT_REVIEWED")).upper()
+    ai_status = str(ai.get("status", "UNKNOWN")).upper()
+
+    if decision not in {"TAKE", "CONSIDER"} or ai_status != "OK":
+        log.info(
+            "TRADE NOT APPROVED | symbol=%s | decision=%s | AI_status=%s",
+            symbol,
+            decision,
+            ai_status,
+        )
+        return
+
+    if not allow_auto or self.mode != "AUTO":
+        log.info(
+            "NO AUTOMATIC ORDER | symbol=%s | allow_auto=%s | mode=%s",
+            symbol,
+            allow_auto,
+            self.mode,
+        )
+        return
+
+    if self.settings.trading_env == "LIVE":
+        log.warning(
+            "LIVE ENVIRONMENT SELECTED | symbol=%s | "
+            "execution subject to LIVE configuration gates",
+            symbol,
         )
 
-        if executed and filled_quantity > 0 and average > 0:
-            self.notify(
-                f"🚨 PARTIAL/UNCONFIRMED POSITION\n"
-                f"{symbol} {direction}\n"
-                f"Order: {result.get('order_id', 'unknown')}\n"
-                f"Reported filled quantity: {filled_quantity:.8g}\n"
-                f"Average price: {average:.8g}\n"
-                f"Status: {result.get('order_status', 'unknown')}\n"
-                f"Reconciliation required: {reconcile_required}\n"
-                f"Check Bitget orders and positions immediately. "
-                f"Do not assume the order is cancelled or protected."
+    if self.settings.trading_env == "PAPER":
+        capital = self.paper.capital
+    else:
+        can_execute, execute_reason = self.execution.can_execute()
+        if not can_execute:
+            log.warning(
+                "EXECUTION GATE BLOCKED | symbol=%s | reason=%s",
+                symbol,
+                execute_reason,
             )
-        else:
+            return
+        capital = self.execution.equity()
+
+    if capital is None or capital <= 0:
+        log.warning(
+            "RISK BLOCK | symbol=%s | reason=equity_unavailable",
+            symbol,
+        )
+        if self.mode == "AUTO":
             self.notify(
-                f"⚠️ ORDER NOT CONFIRMED\n"
-                f"{symbol}\n"
-                f"Error: {result.get('error', 'unknown')}\n"
-                f"Reconciliation required: {reconcile_required}\n"
-                f"Check Bitget order history before any manual retry."
+                f"⚠️ {symbol} BLOCKED\n"
+                f"Account equity unavailable. No order was sent."
             )
+        return
+
+    ok, reason = risk_check(
+        self.settings,
+        self.db,
+        signal,
+        capital,
+    )
+
+    if not ok:
+        log.warning(
+            "RISK BLOCK | symbol=%s | reason=%s",
+            symbol,
+            reason,
+        )
+        return
+
+    log.info(
+        "RISK CHECK PASSED | symbol=%s | capital=%.4f",
+        symbol,
+        capital,
+    )
+
+    if any(
+        trade["symbol"] == symbol
+        for trade in self.db.open_trades()
+    ):
+        log.info(
+            "ORDER SKIPPED | symbol=%s | reason=position_already_open",
+            symbol,
+        )
+        return
+
+    risk_fraction = self.settings.risk_per_trade * (
+        0.5 if self.profile == "SAFE" else 1
+    )
+
+    quantity = position_size(
+        capital,
+        signal["price"],
+        signal["stop"],
+        risk_fraction,
+    )
+
+    if self.settings.trading_env != "PAPER":
+        max_quantity_by_margin = (
+            self.settings.max_margin_per_trade
+            * self.settings.leverage
+            / max(signal["price"], 1e-12)
+        )
+        quantity = min(quantity, max_quantity_by_margin)
+
+    if quantity <= 0:
+        log.warning(
+            "ORDER BLOCKED | symbol=%s | reason=quantity_not_positive",
+            symbol,
+        )
+        return
+
+    if self.settings.trading_env == "PAPER":
+        trade_id = self.paper.open(symbol, signal, "AUTO")
+        if trade_id:
+            log.info(
+                "PAPER TRADE OPENED | symbol=%s
+
 
     def scan_once(self, allow_auto=True):
         symbols = self.db.enabled_symbols()
