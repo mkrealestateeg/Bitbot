@@ -339,7 +339,7 @@ class ExecutionEngine:
     # Execute order
     # ---------------------------------------------------------
 
-    def execute(self, plan):
+def execute(self, plan):
     ok, why = self.can_execute()
 
     if not ok:
