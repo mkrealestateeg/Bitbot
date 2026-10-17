@@ -192,7 +192,7 @@ class Settings:
         value.strip().upper()
         for value in os.getenv(
             "SYMBOLS",
-            "FET/USDT:USDT,NEAR/USDT:USDT,RENDER/USDT:USDT",
+            "doge/USDT:USDT,uni/USDT:USDT,avax/USDT:USDT",
         ).split(",")
         if value.strip()
     )
