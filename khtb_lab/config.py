@@ -122,6 +122,11 @@ class Settings:
     request_timeout: int = _int(
         "EXCHANGE_REQUEST_TIMEOUT", 15
     )
+        # Maximum allowed deviation between planned entry and
+    # live market price immediately before order submission.
+    max_entry_deviation_pct: float = _float(
+        "MAX_ENTRY_DEVIATION_PCT", 0.5
+    )
 
     # Trading controls
     trading_mode: str = os.getenv(
