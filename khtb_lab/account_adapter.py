@@ -155,6 +155,31 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
                 code = None
                 message = str(payload)
 
+            if path == "/api/v3/trade/place-order":
+                order_context = {
+                    key: body[key]
+                    for key in (
+                        "category",
+                        "symbol",
+                        "qty",
+                        "side",
+                        "orderType",
+                        "clientOid",
+                        "reduceOnly",
+                        "marginMode",
+                        "posSide",
+                    )
+                    if key in body
+                }
+                log.error(
+                    "BITGET ENTRY ORDER REJECTED | http_status=%s | "
+                    "code=%s | message=%s | params=%s",
+                    response.status_code,
+                    code,
+                    message,
+                    order_context,
+                )
+
             raise RuntimeError(
                 f"Bitget HTTP {response.status_code}: "
                 f"{code} {message}"
@@ -166,6 +191,31 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             )
 
         if str(payload.get("code")) != "00000":
+            if path == "/api/v3/trade/place-order":
+                order_context = {
+                    key: body[key]
+                    for key in (
+                        "category",
+                        "symbol",
+                        "qty",
+                        "side",
+                        "orderType",
+                        "clientOid",
+                        "reduceOnly",
+                        "marginMode",
+                        "posSide",
+                    )
+                    if key in body
+                }
+                log.error(
+                    "BITGET ENTRY ORDER REJECTED | http_status=%s | "
+                    "code=%s | message=%s | params=%s",
+                    response.status_code,
+                    payload.get("code"),
+                    payload.get("msg"),
+                    order_context,
+                )
+
             raise RuntimeError(
                 f"Bitget API {payload.get('code')}: "
                 f"{payload.get('msg')}"
@@ -539,8 +589,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
         side,
         qty,
         client_oid,
-        stop=None,
-        target=None,
     ):
         if not client_oid:
             raise ValueError(
@@ -587,34 +635,6 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
                 else "short"
             )
 
-        if target is not None:
-            target_value = self._number(target)
-
-            if target_value is None or target_value <= 0:
-                raise ValueError(
-                    "Invalid take-profit price"
-                )
-
-            body.update({
-                "takeProfit": str(target),
-                "tpTriggerBy": "mark",
-                "tpOrderType": "market",
-            })
-
-        if stop is not None:
-            stop_value = self._number(stop)
-
-            if stop_value is None or stop_value <= 0:
-                raise ValueError(
-                    "Invalid stop-loss price"
-                )
-
-            body.update({
-                "stopLoss": str(stop),
-                "slTriggerBy": "mark",
-                "slOrderType": "market",
-            })
-
         return (
             self._signed_request(
                 "POST",
@@ -623,6 +643,83 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             )
             or {}
         )
+
+    def place_tpsl_order(
+        self,
+        symbol,
+        side,
+        client_oid,
+        stop,
+        target,
+        pos_side=None,
+    ):
+        if not client_oid:
+            raise ValueError(
+                "client_oid is required for TPSL order reconciliation"
+            )
+
+        side = str(side).lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("TPSL side must be 'buy' or 'sell'")
+
+        stop_value = self._number(stop)
+        target_value = self._number(target)
+        if stop_value is None or stop_value <= 0:
+            raise ValueError("Invalid stop-loss price")
+        if target_value is None or target_value <= 0:
+            raise ValueError("Invalid take-profit price")
+
+        body = {
+            "category": self.settings.product_category,
+            "symbol": self._symbol(symbol),
+            "type": "tpsl",
+            "tpslMode": "full",
+            "side": side,
+            "clientOid": str(client_oid),
+            "marginMode": self.settings.margin_mode,
+            "takeProfit": str(target),
+            "tpTriggerBy": "mark",
+            "tpOrderType": "market",
+            "stopLoss": str(stop),
+            "slTriggerBy": "mark",
+            "slOrderType": "market",
+        }
+
+        if self.settings.position_mode == "hedge":
+            normalized_pos_side = str(pos_side or "").lower()
+            if normalized_pos_side not in {"long", "short"}:
+                raise ValueError(
+                    "pos_side must be 'long' or 'short' in hedge mode"
+                )
+            body["posSide"] = normalized_pos_side
+        else:
+            body["reduceOnly"] = "yes"
+
+        return (
+            self._signed_request(
+                "POST",
+                "/api/v3/trade/place-strategy-order",
+                body=body,
+            )
+            or {}
+        )
+
+    def unfilled_strategy_orders(self):
+        data = self._signed_request(
+            "GET",
+            "/api/v3/trade/unfilled-strategy-orders",
+            params={
+                "category": self.settings.product_category,
+                "type": "tpsl",
+            },
+        )
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            orders = data.get("list")
+            return orders if isinstance(orders, list) else []
+        return []
 
     def order_info(
         self,

@@ -144,8 +144,8 @@ class KhtbLab:
             symbol,
             direction,
             average,
-            signal["stop"],
-            signal["target"],
+            result.get("stop", signal["stop"]),
+            result.get("target", signal["target"]),
             filled_quantity,
             mode="AUTO",
             source=self.settings.trading_env,
@@ -199,10 +199,12 @@ class KhtbLab:
                 f"✅ TRADE FILLED — SL/TP CONFIRMED\n"
                 f"{symbol} {direction}\n"
                 f"Order: {result.get('order_id', 'unknown')}\n"
+                f"Protection order: "
+                f"{result.get('protection_order_id', 'unknown')}\n"
                 f"Entry fill: {result['average']:.8g}\n"
                 f"Filled quantity: {result['filled_quantity']:.8g}\n"
-                f"SL: {signal['stop']:.8g}\n"
-                f"TP: {signal['target']:.8g}\n"
+                f"SL: {result.get('stop', signal['stop'])}\n"
+                f"TP: {result.get('target', signal['target'])}\n"
                 f"Trade ID: {trade_id}\n"
                 f"Environment: {self.settings.trading_env}"
             )
@@ -221,11 +223,15 @@ class KhtbLab:
             f"🚨 WARNING: POSITION OPEN — PROTECTION UNCONFIRMED\n"
             f"{symbol} {direction}\n"
             f"Order: {result.get('order_id', 'unknown')}\n"
+            f"Protection order: "
+            f"{protection.get('order_id', 'unknown')}\n"
             f"Entry fill: {result['average']:.8g}\n"
             f"Filled quantity: {result['filled_quantity']:.8g}\n"
             f"Trade ID: {trade_id}\n"
             f"SL confirmed: {protection.get('stop_confirmed', False)}\n"
             f"TP confirmed: {protection.get('target_confirmed', False)}\n"
+            f"Protection status: {protection.get('status', 'unknown')}\n"
+            f"Reason: {protection.get('reason', 'unknown')}\n"
             f"Check the open position and set/verify SL and TP "
             f"on Bitget immediately. Do not assume it is protected."
         )

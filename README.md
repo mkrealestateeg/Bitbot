@@ -16,6 +16,7 @@ The polling request serializes `allowed_updates` as JSON. This avoids the HTTP 4
 
 ## Exchange
 Set `EXCHANGE_ID` to a CCXT-supported exchange id and `EXCHANGE_NAME` to the display name. Use separate DEMO/LIVE keys.
+For Bitget UTA, market entries are precision-adjusted and confirmed filled before a separate full-position TPSL strategy order is submitted and checked against active strategy orders. If protection is not confirmed, the bot reports the open position as unprotected; verify all behavior in DEMO before enabling LIVE.
 
 ## Deployment
 Railway should run `python main.py`. Keep `TRADING_ENV=DEMO`, `DEMO_TRADING_ARMED=false`, and `LIVE_TRADING_ARMED=false` until a controlled DEMO test is explicitly started.

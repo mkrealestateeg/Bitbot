@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 
 import ccxt
 
@@ -195,12 +196,16 @@ class ExecutionEngine:
         }
 
     def _precision_quantity(self, symbol, quantity):
-        if not self.exchange:
-            return float(quantity)
+        if self.exchange:
+            return self.exchange.amount_to_precision(symbol, quantity)
 
-        return float(
-            self.exchange.amount_to_precision(symbol, quantity)
-        )
+        return format(Decimal(str(quantity)).normalize(), "f")
+
+    def _precision_price(self, symbol, price):
+        if self.exchange:
+            return self.exchange.price_to_precision(symbol, price)
+
+        return format(Decimal(str(price)).normalize(), "f")
 
     # ---------------------------------------------------------
     # Order reconciliation helpers
@@ -233,6 +238,121 @@ class ExecutionEngine:
             symbol,
             order_id=order_id or None,
             client_oid=client_oid or None,
+        )
+
+    @staticmethod
+    def _same_decimal(value, expected):
+        try:
+            return Decimal(str(value)) == Decimal(str(expected))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+
+    def _reconcile_tpsl_order(
+        self,
+        symbol,
+        order_id,
+        client_oid,
+        stop,
+        target,
+        seconds=5,
+    ):
+        """Confirm the separate TPSL strategy order is active on Bitget."""
+
+        deadline = time.time() + seconds
+        last_match = None
+
+        while time.time() < deadline:
+            try:
+                orders = self.account.unfilled_strategy_orders()
+                if not isinstance(orders, list):
+                    orders = []
+
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+
+                    matches_id = (
+                        order_id
+                        and str(order.get("orderId") or "") == str(order_id)
+                    )
+                    matches_client_oid = (
+                        client_oid
+                        and str(order.get("clientOid") or "") == client_oid
+                    )
+                    if not (matches_id or matches_client_oid):
+                        continue
+
+                    last_match = order
+                    stop_confirmed = self._same_decimal(
+                        order.get("stopLoss"),
+                        stop,
+                    )
+                    target_confirmed = self._same_decimal(
+                        order.get("takeProfit"),
+                        target,
+                    )
+                    status = str(order.get("status") or "").lower()
+                    active = status in {"pending", "submitting"}
+                    return {
+                        "ok": active and stop_confirmed and target_confirmed,
+                        "stop_confirmed": stop_confirmed,
+                        "target_confirmed": target_confirmed,
+                        "actual_stop": order.get("stopLoss"),
+                        "actual_target": order.get("takeProfit"),
+                        "order_id": order.get("orderId") or order_id,
+                        "client_oid": order.get("clientOid") or client_oid,
+                        "status": status or "unknown",
+                        "reason": (
+                            None
+                            if active and stop_confirmed and target_confirmed
+                            else "TPSL strategy order is not active or levels differ"
+                        ),
+                    }
+
+            except Exception:
+                log.warning(
+                    "TPSL RECONCILIATION POLL FAILED | "
+                    "symbol=%s | order_id=%s | client_oid=%s",
+                    symbol,
+                    order_id or "unknown",
+                    client_oid,
+                    exc_info=True,
+                )
+
+            time.sleep(1)
+
+        return {
+            "ok": False,
+            "stop_confirmed": False,
+            "target_confirmed": False,
+            "actual_stop": (
+                last_match.get("stopLoss") if last_match else None
+            ),
+            "actual_target": (
+                last_match.get("takeProfit") if last_match else None
+            ),
+            "order_id": order_id or (
+                last_match.get("orderId") if last_match else None
+            ),
+            "client_oid": client_oid,
+            "status": (
+                str(last_match.get("status") or "unknown").lower()
+                if last_match
+                else "not_found"
+            ),
+            "reason": (
+                "TPSL strategy order was not found in active orders"
+                if not last_match
+                else "TPSL strategy order did not confirm both active levels"
+            ),
+        }
+
+    @staticmethod
+    def _is_parameter_rejection(error):
+        message = str(error)
+        return (
+            "Bitget HTTP 400: 25200" in message
+            or "Bitget API 25200:" in message
         )
 
     def _reconcile_order(
@@ -285,55 +405,6 @@ class ExecutionEngine:
             time.sleep(1)
 
         return order_id, last_info
-
-    def _protection_status(self, info, stop, target):
-        """Report whether the exchange response confirms both protections."""
-
-        if not isinstance(info, dict):
-            return {
-                "ok": False,
-                "stop_confirmed": False,
-                "target_confirmed": False,
-                "status": "UNVERIFIED",
-                "reason": "order information unavailable",
-            }
-
-        actual_stop = self._as_float(info.get("stopLoss"))
-        actual_target = self._as_float(info.get("takeProfit"))
-
-        expected_stop = self._as_float(stop)
-        expected_target = self._as_float(target)
-
-        # Require the exchange to return actual protection values.
-        # Missing values are not treated as confirmation.
-        stop_confirmed = (
-            actual_stop > 0
-            and expected_stop > 0
-            and abs(actual_stop - expected_stop)
-            <= max(expected_stop * 0.0001, 1e-10)
-        )
-
-        target_confirmed = (
-            actual_target > 0
-            and expected_target > 0
-            and abs(actual_target - expected_target)
-            <= max(expected_target * 0.0001, 1e-10)
-        )
-
-        ok = stop_confirmed and target_confirmed
-
-        return {
-            "ok": ok,
-            "stop_confirmed": stop_confirmed,
-            "target_confirmed": target_confirmed,
-            "actual_stop": actual_stop or None,
-            "actual_target": actual_target or None,
-            "status": "CONFIRMED" if ok else "UNVERIFIED",
-            "reason": (
-                None if ok
-                else "Exchange response did not confirm both SL and TP"
-            ),
-        }
 
     # ---------------------------------------------------------
     # Execute order
@@ -470,22 +541,63 @@ class ExecutionEngine:
                 symbol,
                 float(plan["quantity"]),
             )
+            stop = self._precision_price(symbol, plan["stop"])
+            target = self._precision_price(symbol, plan["target"])
         except Exception as exc:
-            log.exception("Quantity precision conversion failed")
+            log.exception("Order precision conversion failed")
             return {
                 "success": False,
                 "executed": False,
-                "error": f"quantity_precision_error:{exc}",
+                "error": f"order_precision_error:{exc}",
                 "reconcile_required": False,
             }
 
-        if qty <= 0:
+        if float(qty) <= 0:
             return {
                 "success": False,
                 "executed": False,
                 "error": "quantity rounded to zero",
                 "reconcile_required": False,
             }
+
+        precise_stop = self._as_float(stop)
+        precise_target = self._as_float(target)
+        if direction == "LONG" and not (
+            0 < precise_stop < live_price < precise_target
+        ):
+            return {
+                "success": False,
+                "executed": False,
+                "error": "rounded_long_stop_or_target_invalid",
+                "reconcile_required": False,
+            }
+        if direction == "SHORT" and not (
+            0 < precise_target < live_price < precise_stop
+        ):
+            return {
+                "success": False,
+                "executed": False,
+                "error": "rounded_short_stop_or_target_invalid",
+                "reconcile_required": False,
+            }
+
+        if self.exchange:
+            market = self.exchange.market(symbol)
+            minimum_quantity = (
+                (market.get("limits") or {})
+                .get("amount", {})
+                .get("min")
+            )
+            if (
+                minimum_quantity is not None
+                and Decimal(qty) < Decimal(str(minimum_quantity))
+            ):
+                return {
+                    "success": False,
+                    "executed": False,
+                    "error": "quantity_below_exchange_minimum",
+                    "reconcile_required": False,
+                }
 
         side = "buy" if direction == "LONG" else "sell"
         client_oid = "khtb-" + uuid.uuid4().hex[:20]
@@ -527,12 +639,27 @@ class ExecutionEngine:
                 side,
                 qty,
                 client_oid,
-                stop=plan["stop"],
-                target=plan["target"],
             )
 
         except Exception as exc:
             submission_error = f"{type(exc).__name__}:{exc}"
+
+            if self._is_parameter_rejection(submission_error):
+                log.error(
+                    "ORDER SUBMISSION REJECTED | symbol=%s | "
+                    "client_oid=%s | error=%s",
+                    symbol,
+                    client_oid,
+                    submission_error,
+                )
+                return {
+                    "success": False,
+                    "executed": False,
+                    "error": f"order_rejected:{submission_error}",
+                    "submission_error": submission_error,
+                    "client_oid": client_oid,
+                    "reconcile_required": False,
+                }
 
             log.exception(
                 "ORDER SUBMISSION RESULT UNKNOWN; "
@@ -632,18 +759,54 @@ class ExecutionEngine:
                 "reconcile_required": True,
             }
 
-        protection = self._protection_status(
-            info,
-            plan["stop"],
-            plan["target"],
+        protection_client_oid = "tpsl-" + uuid.uuid4().hex[:20]
+        protection_side = "sell" if direction == "LONG" else "buy"
+        protection_ack = None
+        protection_submission_error = None
+
+        try:
+            protection_ack = self.account.place_tpsl_order(
+                symbol,
+                side=protection_side,
+                client_oid=protection_client_oid,
+                stop=stop,
+                target=target,
+                pos_side=direction.lower(),
+            )
+        except Exception as exc:
+            protection_submission_error = (
+                f"{type(exc).__name__}:{exc}"
+            )
+            log.exception(
+                "POSITION FILLED BUT TPSL SUBMISSION FAILED | "
+                "symbol=%s | entry_order_id=%s | client_oid=%s",
+                symbol,
+                order_id,
+                protection_client_oid,
+            )
+
+        protection_order_id = self._extract_order_id(protection_ack)
+        protection = self._reconcile_tpsl_order(
+            symbol,
+            protection_order_id,
+            protection_client_oid,
+            stop,
+            target,
         )
+        if protection_submission_error and not protection["ok"]:
+            protection["reason"] = (
+                f"{protection['reason']}; submission error: "
+                f"{protection_submission_error}"
+            )
 
         if not protection["ok"]:
             log.critical(
-                "POSITION FILLED BUT SL/TP NOT CONFIRMED | "
-                "symbol=%s | order_id=%s | protection=%s",
+                "POSITION FILLED BUT SL/TP NOT ACTIVE | "
+                "symbol=%s | entry_order_id=%s | tpsl_order_id=%s | "
+                "protection=%s",
                 symbol,
                 order_id,
+                protection.get("order_id"),
                 protection,
             )
 
@@ -659,6 +822,9 @@ class ExecutionEngine:
             "order_status": status,
             "environment": self.environment,
             "leverage_result": leverage_result,
+            "stop": stop,
+            "target": target,
+            "protection_order_id": protection.get("order_id"),
             "protection": protection,
             "warning": (
                 None
