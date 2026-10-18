@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 import math
 import time
+from decimal import Decimal
+
+import pandas as pd
 
 from .config import Settings
 from .database import Database
+from .indicators import enrich
 from .market import Market
-from .strategy import MIN_REWARD_RISK, analyze
+from .strategy import MIN_REWARD_RISK, STOP_BUFFER_ATR, analyze
 from .risk import risk_check, position_size
 from .paper import PaperBroker
 from .execution import ExecutionEngine
@@ -18,6 +22,10 @@ log = logging.getLogger(__name__)
 
 
 class KhtbLab:
+    PROFIT_LOCK_STAGE = 1
+    TARGET_REMOVED_STAGE = 2
+    TARGET_CROSSED_STAGE = 3
+
     def __init__(self, settings):
         settings.validate()
         self.settings = settings
@@ -94,7 +102,7 @@ class KhtbLab:
         entry = float(trade["entry"])
         stop = float(trade["stop"])
         target = float(trade["target"])
-        risk = abs(entry - stop)
+        risk = float(trade.get("initial_risk") or abs(entry - stop))
         progress = (float(price) - entry) * direction
         events = []
         target_distance = abs(target - entry)
@@ -119,6 +127,362 @@ class KhtbLab:
                 "في منطقة ربح.",
             ))
         return events
+
+    @staticmethod
+    def _favorable_price(direction, previous, current):
+        if direction == "LONG":
+            return max(float(previous or current), float(current))
+        return min(float(previous or current), float(current))
+
+    def _favorable_price_from_candles(
+        self, trade, frame, current_price, previous
+    ):
+        direction = str(trade.get("direction") or "").upper()
+        favorable = self._favorable_price(
+            direction, previous, current_price
+        )
+        opened_at = trade.get("ts_open")
+        if not opened_at:
+            return favorable
+
+        try:
+            opened_at = pd.to_datetime(opened_at, utc=True)
+            post_entry = frame.loc[frame["timestamp"] > opened_at]
+            if post_entry.empty:
+                return favorable
+            if direction == "LONG":
+                candle_extreme = float(post_entry["high"].max())
+                return max(favorable, candle_extreme)
+            if direction == "SHORT":
+                candle_extreme = float(post_entry["low"].min())
+                return min(favorable, candle_extreme)
+        except (KeyError, TypeError, ValueError):
+            log.exception(
+                "Could not derive favorable price from candles | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+        return favorable
+
+    def _structural_trailing_stop(self, trade, frame, current_price, atr):
+        direction = str(trade.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"} or atr <= 0:
+            return None
+
+        opened_at = trade.get("ts_open")
+        if not opened_at:
+            return None
+        try:
+            opened_at = pd.to_datetime(opened_at, utc=True)
+            closed = frame.iloc[:-1]
+            history = closed.loc[closed["timestamp"] >= opened_at].tail(80)
+        except (KeyError, TypeError, ValueError):
+            log.exception(
+                "Cannot locate closed candles for structural trailing | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            return None
+
+        if len(history) < 5:
+            return None
+
+        entry = float(trade["entry"])
+        current_stop = float(trade["stop"])
+        candidates = []
+        for index in range(2, len(history) - 2):
+            window = history.iloc[index - 2:index + 3]
+            candle = history.iloc[index]
+            if direction == "LONG":
+                level = float(candle["low"])
+                is_pivot = (
+                    level <= float(window["low"].min())
+                    and level < float(window["low"].max())
+                )
+                stop = level - STOP_BUFFER_ATR * atr
+                eligible = (
+                    is_pivot
+                    and stop > current_stop
+                    and stop > entry
+                    and stop < current_price
+                )
+            else:
+                level = float(candle["high"])
+                is_pivot = (
+                    level >= float(window["high"].max())
+                    and level > float(window["high"].min())
+                )
+                stop = level + STOP_BUFFER_ATR * atr
+                eligible = (
+                    is_pivot
+                    and stop < current_stop
+                    and stop < entry
+                    and stop > current_price
+                )
+            if not eligible:
+                continue
+
+            try:
+                rounded_text = self.execution._precision_price(
+                    trade["symbol"], stop
+                )
+                rounded_decimal = Decimal(str(rounded_text))
+                stop_decimal = Decimal(str(stop))
+                tick = Decimal(1).scaleb(
+                    rounded_decimal.as_tuple().exponent
+                )
+                if direction == "LONG" and rounded_decimal > stop_decimal:
+                    rounded_decimal -= tick
+                elif direction == "SHORT" and rounded_decimal < stop_decimal:
+                    rounded_decimal += tick
+                rounded_stop = float(
+                    self.execution._precision_price(
+                        trade["symbol"], float(rounded_decimal)
+                    )
+                )
+            except (AttributeError, TypeError, ValueError):
+                log.exception(
+                    "Could not apply exchange price precision to trailing "
+                    "stop | trade_id=%s",
+                    trade.get("id"),
+                )
+                return None
+
+            conservative = (
+                rounded_stop <= stop
+                if direction == "LONG"
+                else rounded_stop >= stop
+            )
+            still_valid = (
+                current_stop < rounded_stop < current_price
+                and rounded_stop > entry
+                if direction == "LONG"
+                else current_price < rounded_stop < current_stop
+                and rounded_stop < entry
+            )
+            if conservative and still_valid:
+                candidates.append((candle["timestamp"], rounded_stop))
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def _manage_exchange_trades(self):
+        """Advance protection only for positions confirmed by reconciliation."""
+        trades = self.db.open_trades(self.settings.trading_env)
+        if not trades:
+            return True
+        if not getattr(self.execution, "positions_reconciled", False):
+            return False
+
+        all_ok = True
+        for trade in trades:
+            try:
+                frame = self.market.candles(
+                    trade["symbol"], self.settings.timeframe_main, 120
+                )
+                if len(frame) < 8:
+                    raise ValueError("insufficient_closed_candles")
+
+                enriched = enrich(frame)
+                closed = enriched.iloc[:-1]
+                atr = float(closed.iloc[-1]["atr"])
+                if not math.isfinite(atr) or atr <= 0:
+                    raise ValueError("invalid_trailing_atr")
+
+                price = self.current_price(trade["symbol"])
+                direction = str(trade["direction"]).upper()
+                if direction not in {"LONG", "SHORT"}:
+                    raise ValueError("invalid_position_direction")
+                entry = float(trade["entry"])
+                quantity = float(trade["qty"])
+                notional = entry * quantity
+                if notional <= 0:
+                    raise ValueError("invalid_position_notional")
+
+                stage = int(trade.get("management_stage") or 0)
+                favorable = self._favorable_price_from_candles(
+                    trade,
+                    frame,
+                    price,
+                    trade.get("favorable_price") or entry,
+                )
+                signed_direction = 1 if direction == "LONG" else -1
+                favorable_progress = (
+                    (favorable - entry) * signed_direction
+                )
+                favorable_pnl = favorable_progress * quantity
+                pnl_on_notional = favorable_pnl / notional
+                target_distance = (
+                    (float(trade["target"]) - entry)
+                    * (1 if direction == "LONG" else -1)
+                )
+                if target_distance <= 0:
+                    raise ValueError("invalid_virtual_tp2")
+
+                stop = float(trade["stop"])
+                just_activated = False
+                if stage == 0 and pnl_on_notional >= 0.10:
+                    stage = self.PROFIT_LOCK_STAGE
+                    just_activated = True
+                    log.info(
+                        "STRUCTURAL TRAILING ACTIVATED | trade_id=%s | "
+                        "symbol=%s | pnl_on_notional=%.4f",
+                        trade["id"],
+                        trade["symbol"],
+                        pnl_on_notional,
+                    )
+                    self.notify(
+                        f"🛡 {trade['symbol']} وصل الربح العائم إلى "
+                        f"{pnl_on_notional:.1%} من قيمة المركز؛ بدأ تتبع "
+                        "الوقف خلف القمم/القيعان المؤكدة."
+                    )
+
+                candidate_stop = None
+                if stage >= self.PROFIT_LOCK_STAGE:
+                    candidate_stop = self._structural_trailing_stop(
+                        trade, frame, price, atr
+                    )
+
+                target_near = (
+                    favorable_progress >= target_distance * 0.90
+                )
+                stop_now = candidate_stop or stop
+                locked_profit = (
+                    stop_now > entry
+                    if direction == "LONG"
+                    else stop_now < entry
+                )
+                remove_target = (
+                    stage >= self.PROFIT_LOCK_STAGE
+                    and stage < self.TARGET_REMOVED_STAGE
+                    and target_near
+                    and locked_profit
+                )
+                stop_changed = candidate_stop is not None
+                if stop_changed or remove_target:
+                    trade_for_update = {
+                        **trade,
+                        "management_stage": stage,
+                    }
+                    result = self.execution.update_tpsl_protection(
+                        trade_for_update,
+                        stop_now,
+                        (
+                            None
+                            if remove_target
+                            or stage >= self.TARGET_REMOVED_STAGE
+                            else trade["target"]
+                        ),
+                    )
+                    if not result.get("ok"):
+                        all_ok = False
+                        self.execution.positions_reconciled = False
+                        if not self.db.save_trade_management(
+                            trade["id"],
+                            stage,
+                            favorable,
+                            stop,
+                        ):
+                            log.error(
+                                "Could not persist pending protection "
+                                "management state | trade_id=%s",
+                                trade["id"],
+                            )
+                        log.critical(
+                            "STRUCTURAL PROTECTION UPDATE FAILED | "
+                            "trade_id=%s | symbol=%s | reason=%s",
+                            trade["id"],
+                            trade["symbol"],
+                            result.get("reason"),
+                        )
+                        self.notify(
+                            f"🚨 تعذّر تأكيد تعديل حماية "
+                            f"{trade['symbol']} على Bitget. بقيت الحماية "
+                            "السابقة كما هي؛ أوقفت أوامر AUTO الجديدة "
+                            "حتى نجاح المصالحة."
+                        )
+                        continue
+
+                    stop = stop_now
+                    if remove_target:
+                        stage = self.TARGET_REMOVED_STAGE
+                        log.info(
+                            "VIRTUAL TP2 ACTIVATED | exchange TP removed "
+                            "and SL confirmed | trade_id=%s | symbol=%s | "
+                            "stop=%s | virtual_tp2=%s",
+                            trade["id"],
+                            trade["symbol"],
+                            stop,
+                            trade["target"],
+                        )
+                        self.notify(
+                            f"🎯 {trade['symbol']} وصل إلى 90% من مسافة "
+                            "TP2 البنيوي: أزيل هدف المنصة بعد تأكيد بقاء "
+                            f"وقف الحماية عند {stop:.8g}. سيبقى المركز "
+                            "كاملًا مفتوحًا ويستمر التتبع البنيوي."
+                        )
+                    elif stop_changed:
+                        log.info(
+                            "STRUCTURAL STOP ADVANCED | trade_id=%s | "
+                            "symbol=%s | old_stop=%s | new_stop=%s | "
+                            "virtual_tp2=%s",
+                            trade["id"],
+                            trade["symbol"],
+                            trade["stop"],
+                            stop,
+                            trade["target"],
+                        )
+
+                if (
+                    stage >= self.TARGET_REMOVED_STAGE
+                    and stage < self.TARGET_CROSSED_STAGE
+                    and favorable_progress >= target_distance
+                ):
+                    stage = self.TARGET_CROSSED_STAGE
+                    log.info(
+                        "VIRTUAL TP2 CROSSED | trade_id=%s | symbol=%s | "
+                        "price=%s | trailing_continues=true",
+                        trade["id"],
+                        trade["symbol"],
+                        price,
+                    )
+                    self.notify(
+                        f"🚀 {trade['symbol']} تجاوز TP2 البنيوي الافتراضي "
+                        f"عند {trade['target']:.8g}. المركز ما زال كاملًا "
+                        "مفتوحًا والوقف يتبع القيعان/القمم المؤكدة."
+                    )
+
+                if just_activated and candidate_stop is None:
+                    self.notify(
+                        f"ℹ️ {trade['symbol']}: لم يتكوّن بعد ارتداد "
+                        "بنيوي مؤكد يتيح رفع الوقف بأمان؛ وقف Bitget الحالي "
+                        "لم يتغير."
+                    )
+
+                if not self.db.save_trade_management(
+                    trade["id"],
+                    stage,
+                    favorable,
+                    stop,
+                    result.get("order_id") if stop_changed or remove_target else None,
+                    result.get("client_oid") if stop_changed or remove_target else None,
+                ):
+                    raise RuntimeError("trade_management_state_not_saved")
+
+            except Exception:
+                all_ok = False
+                log.exception(
+                    "OPEN TRADE MANAGEMENT FAILED | trade_id=%s | symbol=%s",
+                    trade.get("id"),
+                    trade.get("symbol"),
+                )
+                self.notify(
+                    f"🚨 تعذّرت متابعة إدارة الحماية للصفقة "
+                    f"{trade.get('symbol', 'unknown')}. لم يُرسل تعديل "
+                    "غير مؤكد، وتم إيقاف أوامر AUTO الجديدة لهذه الدورة."
+                )
+        return all_ok
 
     def close_trade_from_telegram(self, trade_id):
         trade = next(
@@ -238,15 +602,34 @@ class KhtbLab:
         return settled
 
     def _sync_exchange_protection(self, reconciliation):
+        trades = {
+            int(trade["id"]): trade
+            for trade in self.db.open_trades(self.settings.trading_env)
+        }
         for update in reconciliation.get("protection_updates", []):
-            if self.db.update_trade_stop(
-                update["trade_id"], update["stop"]
+            trade = trades.get(int(update["trade_id"]))
+            if trade and self.db.save_trade_management(
+                trade["id"],
+                int(
+                    update.get("management_stage")
+                    or trade.get("management_stage")
+                    or 0
+                ),
+                float(
+                    update.get("favorable_price")
+                    or trade.get("favorable_price")
+                    or trade["entry"]
+                ),
+                update["stop"],
+                update.get("order_id"),
+                update.get("client_oid"),
             ):
                 log.info(
                     "SAFER EXCHANGE STOP SYNCHRONIZED | trade_id=%s | "
-                    "stop=%s",
+                    "stop=%s | protection_order_id=%s",
                     update["trade_id"],
                     update["stop"],
+                    update.get("order_id"),
                 )
 
     def opportunity_text(self, symbol, signal, ai=None):
@@ -325,6 +708,12 @@ class KhtbLab:
             mode="AUTO",
             source=self.settings.trading_env,
             snapshot=signal.get("snapshot"),
+            protection_order_id=(result.get("protection") or {}).get(
+                "order_id"
+            ),
+            protection_client_oid=(result.get("protection") or {}).get(
+                "client_oid"
+            ),
         )
 
         log.info(
@@ -850,6 +1239,13 @@ class KhtbLab:
                     "EXCHANGE STATE RECONCILED | positions=%s",
                     reconciliation.get("live_positions", 0),
                 )
+                if not self._manage_exchange_trades():
+                    errors += 1
+                    allow_auto = False
+                    log.critical(
+                        "AUTO EXECUTION BLOCKED | reason="
+                        "open_trade_protection_management_failed"
+                    )
 
         log.info(
             "SCAN CYCLE START | symbols=%s | env=%s | mode=%s | "

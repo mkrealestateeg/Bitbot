@@ -1,0 +1,224 @@
+from types import SimpleNamespace
+
+import pandas as pd
+
+from khtb_lab.app import KhtbLab
+from khtb_lab.database import Database
+from khtb_lab.indicators import enrich
+
+
+def _candles(monotonic_lows=False):
+    lows = (
+        [90 + index for index in range(13)]
+        if monotonic_lows
+        else [99, 100, 98, 101, 102, 100, 103, 104, 102, 105, 106, 107, 108]
+    )
+    return pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2025-01-01T00:00:00Z", periods=13, freq="15min"
+        ),
+        "open": [low + 0.5 for low in lows],
+        "high": [low + 2 for low in lows],
+        "low": lows,
+        "close": [low + 1 for low in lows],
+        "volume": [100] * len(lows),
+    })
+
+
+def _app(price, target=120, monotonic_lows=False):
+    app = KhtbLab.__new__(KhtbLab)
+    app.db = Database(":memory:")
+    trade_id = app.db.open_trade(
+        "BTC/USDT",
+        "LONG",
+        100,
+        95,
+        target,
+        2,
+        source="DEMO",
+        snapshot={"atr": 2},
+        protection_order_id="tpsl-1",
+        protection_client_oid="tpsl-client",
+    )
+    app.db.conn.execute(
+        "UPDATE trades SET ts_open=? WHERE id=?",
+        ("2025-01-01T00:00:00+00:00", trade_id),
+    )
+    app.db.conn.commit()
+
+    calls = []
+    app.execution = SimpleNamespace(
+        positions_reconciled=True,
+        _precision_price=lambda symbol, value: f"{value:.4f}",
+        update_tpsl_protection=lambda trade, stop, new_target: (
+            calls.append((trade, stop, new_target))
+            or {
+                "ok": True,
+                "order_id": "tpsl-1",
+                "client_oid": "tpsl-client",
+            }
+        ),
+    )
+    app.market = SimpleNamespace(
+        candles=lambda symbol, timeframe, limit: _candles(monotonic_lows)
+    )
+    app.settings = SimpleNamespace(
+        trading_env="DEMO",
+        timeframe_main="15m",
+    )
+    app.current_price = lambda symbol: price
+    app.notify = lambda message: None
+    return app, calls
+
+
+def test_profit_lock_starts_only_at_ten_percent_of_position_notional():
+    app, calls = _app(price=108)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=109.99)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 0
+    assert trade["stop"] == 95
+    assert calls == []
+    app.db.close()
+
+
+def test_intrabar_favorable_high_triggers_profit_lock_after_retracement():
+    app, calls = _app(price=100, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame.loc[5, "high"] = 113
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["favorable_price"] == 113
+    assert trade["stop"] == 95
+    assert calls == []
+    app.db.close()
+
+
+def test_unreconciled_position_is_never_managed():
+    app, calls = _app(price=118)
+    app.execution.positions_reconciled = False
+    app.market.candles = lambda *args: (_ for _ in ()).throw(
+        AssertionError("unreconciled positions must not be managed")
+    )
+
+    assert app._manage_exchange_trades() is False
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 0
+    assert trade["stop"] == 95
+    assert calls == []
+    app.db.close()
+
+
+def test_confirmed_swing_ratchets_stop_without_changing_full_position_or_tp2():
+    app, calls = _app(price=115)
+    original = app.db.open_trades("DEMO")[0]
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert 100 < trade["stop"] < 115
+    assert trade["qty"] == original["qty"]
+    assert trade["target"] == original["target"]
+    assert len(calls) == 1
+    assert calls[0][1] == trade["stop"]
+    assert calls[0][2] == original["target"]
+    app.db.close()
+
+
+def test_virtual_tp2_removal_requires_profitable_structural_stop_confirmation():
+    app, calls = _app(price=118)
+    original = app.db.open_trades("DEMO")[0]
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 2
+    assert 100 < trade["stop"] < 118
+    assert trade["target"] == original["target"]
+    assert trade["qty"] == original["qty"]
+    assert calls[0][2] is None
+    app.db.close()
+
+
+def test_tp2_remains_active_until_a_profitable_confirmed_swing_exists():
+    app, calls = _app(price=119, monotonic_lows=True)
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["stop"] == 95
+    assert trade["target"] == 120
+    assert calls == []
+    app.db.close()
+
+
+def test_unconfirmed_exchange_update_persists_trigger_and_blocks_auto():
+    app, calls = _app(price=118)
+    app.execution.update_tpsl_protection = (
+        lambda trade, stop, target: calls.append((trade, stop, target))
+        or {"ok": False, "reason": "exchange_state_unconfirmed"}
+    )
+
+    assert app._manage_exchange_trades() is False
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["stop"] == 95
+    assert trade["target"] == 120
+    assert app.execution.positions_reconciled is False
+    assert calls[0][2] is None
+    app.db.close()
+
+
+def test_virtual_tp2_crossing_advances_persisted_trailing_stage():
+    app, _ = _app(price=118)
+    assert app._manage_exchange_trades() is True
+    app.current_price = lambda symbol: 122
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 3
+    assert trade["target"] == 120
+    assert trade["qty"] == 2
+    app.db.close()
+
+
+def test_short_trailing_stop_uses_confirmed_swing_high_and_only_moves_down():
+    app, _ = _app(price=85)
+    highs = [101, 100, 102, 99, 98, 99, 97, 96, 98, 95, 94, 93, 92]
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2025-01-01T00:00:00Z", periods=len(highs), freq="15min"
+        ),
+        "open": [high - 1.5 for high in highs],
+        "high": highs,
+        "low": [high - 2 for high in highs],
+        "close": [high - 1 for high in highs],
+        "volume": [100] * len(highs),
+    })
+    trade = {
+        "id": 3,
+        "symbol": "BTC/USDT",
+        "direction": "SHORT",
+        "entry": 100,
+        "stop": 105,
+        "ts_open": "2025-01-01T00:00:00+00:00",
+    }
+    atr = float(enrich(frame).iloc[-2]["atr"])
+
+    stop = app._structural_trailing_stop(trade, frame, 85, atr)
+
+    assert 85 < stop < 100
+    app.db.close()

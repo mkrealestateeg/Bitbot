@@ -285,8 +285,49 @@ class ExecutionEngine:
                         ).lower()
                         == key[1].lower()
                     )
-                    and self._same_decimal(
-                        order.get("takeProfit"), trade.get("target")
+                    and (
+                        (
+                            not trade.get("protection_order_id")
+                            and not trade.get("protection_client_oid")
+                        )
+                        or (
+                            (
+                                trade.get("protection_order_id")
+                                and str(order.get("orderId") or "")
+                                == str(trade["protection_order_id"])
+                            )
+                            or (
+                                trade.get("protection_client_oid")
+                                and str(order.get("clientOid") or "")
+                                == str(trade["protection_client_oid"])
+                            )
+                        )
+                    )
+                    and (
+                        (
+                            int(trade.get("management_stage") or 0) >= 2
+                            and self._number_or_none(
+                                order.get("takeProfit")
+                            ) is None
+                        )
+                        or (
+                            int(trade.get("management_stage") or 0) < 2
+                            and self._same_decimal(
+                                order.get("takeProfit"),
+                                trade.get("target"),
+                            )
+                        )
+                        or (
+                            int(trade.get("management_stage") or 0) == 1
+                            and self._number_or_none(
+                                order.get("takeProfit")
+                            ) is None
+                            and self._profit_locked(
+                                key[1],
+                                self._as_float(trade.get("entry")),
+                                self._as_float(order.get("stopLoss")),
+                            )
+                        )
                     )
                 ]
                 safe_protection = []
@@ -300,21 +341,52 @@ class ExecutionEngine:
                     elif key[1] == "SHORT" and new_stop <= old_stop:
                         safe_protection.append((new_stop, order))
 
-                if not safe_protection:
+                if len(safe_protection) != 1:
                     mismatches.append(
-                        f"protection_unconfirmed:{key[0]}:{key[1]}"
+                        (
+                            "protection_unconfirmed"
+                            if not safe_protection
+                            else "multiple_matching_protection_orders"
+                        )
+                        + f":{key[0]}:{key[1]}"
                     )
                 else:
-                    actual_stop, _ = (
-                        max(safe_protection, key=lambda item: item[0])
-                        if key[1] == "LONG"
-                        else min(safe_protection, key=lambda item: item[0])
+                    actual_stop, active_order = safe_protection[0]
+                    recovered_stage = int(
+                        trade.get("management_stage") or 0
                     )
-                    if not self._same_decimal(actual_stop, old_stop):
-                        protection_updates.append({
-                            "trade_id": trade["id"],
-                            "stop": actual_stop,
-                        })
+                    if (
+                        recovered_stage == 1
+                        and self._number_or_none(
+                            active_order.get("takeProfit")
+                        ) is None
+                    ):
+                        recovered_stage = 2
+                    if (
+                        not self._same_decimal(actual_stop, old_stop)
+                        or recovered_stage
+                        > int(trade.get("management_stage") or 0)
+                        or not trade.get("protection_order_id")
+                        or not trade.get("protection_client_oid")
+                    ):
+                        if trade.get("id") is None:
+                            mismatches.append(
+                                f"local_trade_id_missing:{key[0]}:{key[1]}"
+                            )
+                        else:
+                            protection_updates.append({
+                                "trade_id": trade["id"],
+                                "stop": actual_stop,
+                                "management_stage": recovered_stage,
+                                "favorable_price": (
+                                    self._as_float(
+                                        trade.get("favorable_price")
+                                    )
+                                    or self._as_float(trade.get("entry"))
+                                ),
+                                "order_id": active_order.get("orderId"),
+                                "client_oid": active_order.get("clientOid"),
+                            })
 
             for key in tracked_trades:
                 if key not in live_positions:
@@ -529,6 +601,24 @@ class ExecutionEngine:
         return 0.0
 
     @staticmethod
+    def _number_or_none(value):
+        try:
+            number = float(value)
+            if math.isfinite(number) and number > 0:
+                return number
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _profit_locked(direction, entry, stop):
+        if direction == "LONG":
+            return stop > entry
+        if direction == "SHORT":
+            return stop < entry
+        return False
+
+    @staticmethod
     def _extract_order_id(data):
         if not isinstance(data, dict):
             return ""
@@ -566,15 +656,19 @@ class ExecutionEngine:
 
         deadline = time.time() + seconds
         last_match = None
+        normalized_symbol = self._normalized_symbol(symbol)
 
         while time.time() < deadline:
             try:
                 orders = self.account.unfilled_strategy_orders()
                 if not isinstance(orders, list):
-                    orders = []
+                    raise ValueError("strategy_order_response_invalid")
 
+                matches = []
                 for order in orders:
                     if not isinstance(order, dict):
+                        continue
+                    if self._normalized_symbol(order.get("symbol")) != normalized_symbol:
                         continue
 
                     matches_id = (
@@ -587,34 +681,46 @@ class ExecutionEngine:
                     )
                     if not (matches_id or matches_client_oid):
                         continue
+                    matches.append(order)
 
+                if len(matches) > 1:
+                    return {
+                        "ok": False,
+                        "reason": "multiple_matching_strategy_orders",
+                    }
+                if matches:
+                    order = matches[0]
                     last_match = order
                     stop_confirmed = self._same_decimal(
                         order.get("stopLoss"),
                         stop,
                     )
-                    target_confirmed = self._same_decimal(
-                        order.get("takeProfit"),
-                        target,
-                    )
+                    if target is None:
+                        target_confirmed = (
+                            self._number_or_none(
+                                order.get("takeProfit")
+                            )
+                            is None
+                        )
+                    else:
+                        target_confirmed = self._same_decimal(
+                            order.get("takeProfit"),
+                            target,
+                        )
                     status = str(order.get("status") or "").lower()
                     active = status in self.ACTIVE_STRATEGY_STATUSES
-                    return {
-                        "ok": active and stop_confirmed and target_confirmed,
-                        "stop_confirmed": stop_confirmed,
-                        "target_confirmed": target_confirmed,
-                        "actual_stop": order.get("stopLoss"),
-                        "actual_target": order.get("takeProfit"),
-                        "order_id": order.get("orderId") or order_id,
-                        "client_oid": order.get("clientOid") or client_oid,
-                        "status": status or "unknown",
-                        "reason": (
-                            None
-                            if active and stop_confirmed and target_confirmed
-                            else "TPSL strategy order is not active or levels differ"
-                        ),
-                    }
-
+                    if active and stop_confirmed and target_confirmed:
+                        return {
+                            "ok": True,
+                            "stop_confirmed": True,
+                            "target_confirmed": True,
+                            "actual_stop": order.get("stopLoss"),
+                            "actual_target": order.get("takeProfit"),
+                            "order_id": order.get("orderId") or order_id,
+                            "client_oid": order.get("clientOid") or client_oid,
+                            "status": status,
+                            "reason": None,
+                        }
             except Exception:
                 log.warning(
                     "TPSL RECONCILIATION POLL FAILED | "
@@ -651,6 +757,229 @@ class ExecutionEngine:
                 if not last_match
                 else "TPSL strategy order did not confirm both active levels"
             ),
+        }
+
+    def update_tpsl_protection(self, trade, stop, target):
+        """Modify one reconciled full-position TPSL order and verify it."""
+        ok, reason = self.can_execute()
+        if not ok:
+            return {"ok": False, "reason": reason}
+
+        direction = str(trade.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return {"ok": False, "reason": "invalid_trade_direction"}
+
+        old_stop = self._as_float(trade.get("stop"))
+        new_stop = self._as_float(stop)
+        if old_stop <= 0 or new_stop <= 0:
+            return {"ok": False, "reason": "invalid_stop_level"}
+        if direction == "LONG" and new_stop < old_stop:
+            return {"ok": False, "reason": "stop_must_only_move_up"}
+        if direction == "SHORT" and new_stop > old_stop:
+            return {"ok": False, "reason": "stop_must_only_move_down"}
+
+        stage = int(trade.get("management_stage") or 0)
+        expected_target = None if stage >= 2 else trade.get("target")
+        target_changed = not (
+            (target is None and expected_target is None)
+            or (
+                target is not None
+                and expected_target is not None
+                and self._same_decimal(target, expected_target)
+            )
+        )
+        stop_changed = not self._same_decimal(new_stop, old_stop)
+        if not stop_changed and not target_changed:
+            return {"ok": False, "reason": "protection_update_has_no_change"}
+        if target is not None and not self._same_decimal(
+            target, trade.get("target")
+        ):
+            return {"ok": False, "reason": "unexpected_virtual_target"}
+        if target is None and stage < 1:
+            return {"ok": False, "reason": "target_removal_before_profit_lock"}
+        if target is None and stage < 2 and not self._profit_locked(
+            direction,
+            self._as_float(trade.get("entry")),
+            new_stop,
+        ):
+            return {
+                "ok": False,
+                "reason": "target_removal_without_profit_protection",
+            }
+
+        stored_order_id = str(trade.get("protection_order_id") or "")
+        stored_client_oid = str(trade.get("protection_client_oid") or "")
+        symbol = self._normalized_symbol(trade.get("symbol"))
+
+        try:
+            positions = self.account.current_positions(trade["symbol"])
+            if not isinstance(positions, list):
+                raise ValueError("position_response_invalid")
+            matching_positions = []
+            for raw_position in positions:
+                position = self._exchange_position(raw_position)
+                if position is None:
+                    continue
+                if (
+                    position["symbol"] == symbol
+                    and position["direction"] == direction
+                ):
+                    matching_positions.append(position)
+            if len(matching_positions) != 1:
+                self.positions_reconciled = False
+                return {
+                    "ok": False,
+                    "reason": (
+                        "position_not_found_before_protection_update"
+                        if not matching_positions
+                        else "position_ambiguous_before_protection_update"
+                    ),
+                }
+            expected_quantity = self._as_float(trade.get("qty"))
+            if (
+                expected_quantity <= 0
+                or abs(
+                    matching_positions[0]["quantity"] - expected_quantity
+                )
+                > max(expected_quantity * 1e-6, 1e-8)
+            ):
+                self.positions_reconciled = False
+                return {
+                    "ok": False,
+                    "reason": "position_quantity_changed_before_protection_update",
+                }
+        except Exception as exc:
+            log.exception(
+                "Could not verify live position before protection update | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "reason": f"position_read_failed:{type(exc).__name__}",
+            }
+
+        try:
+            orders = self.account.unfilled_strategy_orders()
+            if not isinstance(orders, list):
+                raise ValueError("strategy_order_response_invalid")
+        except Exception as exc:
+            log.exception(
+                "Could not read active protection before update | trade_id=%s",
+                trade.get("id"),
+            )
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "reason": f"active_protection_read_failed:{type(exc).__name__}",
+            }
+
+        candidates = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if self._normalized_symbol(order.get("symbol")) != symbol:
+                continue
+            if str(order.get("status") or "").lower() not in (
+                self.ACTIVE_STRATEGY_STATUSES
+            ):
+                continue
+
+            order_id = str(order.get("orderId") or "")
+            client_oid = str(order.get("clientOid") or "")
+            if stored_order_id or stored_client_oid:
+                if not (
+                    (stored_order_id and order_id == stored_order_id)
+                    or (stored_client_oid and client_oid == stored_client_oid)
+                ):
+                    continue
+            if expected_target is None:
+                if self._number_or_none(order.get("takeProfit")) is not None:
+                    continue
+            elif not self._same_decimal(
+                order.get("takeProfit"), expected_target
+            ):
+                continue
+
+            actual_stop = self._number_or_none(order.get("stopLoss"))
+            if actual_stop is None:
+                continue
+            if direction == "LONG" and actual_stop < old_stop:
+                continue
+            if direction == "SHORT" and actual_stop > old_stop:
+                continue
+            if (
+                str(getattr(self.settings, "position_mode", "one_way")).lower()
+                == "hedge"
+                and str(
+                    order.get("posSide") or order.get("holdSide") or ""
+                ).lower()
+                != direction.lower()
+            ):
+                continue
+            candidates.append(order)
+
+        if len(candidates) != 1:
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "reason": (
+                    "protection_order_not_found"
+                    if not candidates
+                    else "multiple_matching_protection_orders"
+                ),
+            }
+
+        current_order = candidates[0]
+        order_id = str(current_order.get("orderId") or stored_order_id)
+        client_oid = str(current_order.get("clientOid") or stored_client_oid)
+        try:
+            self.account.modify_tpsl_order(
+                symbol=trade["symbol"],
+                order_id=order_id,
+                client_oid=client_oid,
+                quantity=self._precision_quantity(
+                    trade["symbol"], trade["qty"]
+                ),
+                stop=stop,
+                target=target,
+                pos_side=direction.lower(),
+            )
+        except Exception as exc:
+            log.exception(
+                "TPSL modification request failed | trade_id=%s | "
+                "order_id=%s",
+                trade.get("id"),
+                order_id or "unknown",
+            )
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "reason": f"protection_update_rejected:{type(exc).__name__}",
+            }
+
+        confirmation = self._reconcile_tpsl_order(
+            trade["symbol"],
+            order_id,
+            client_oid,
+            stop,
+            target,
+        )
+        if not confirmation.get("ok"):
+            self.positions_reconciled = False
+            return {
+                **confirmation,
+                "ok": False,
+                "reason": confirmation.get("reason")
+                or "updated_protection_not_confirmed",
+            }
+
+        return {
+            **confirmation,
+            "ok": True,
+            "order_id": confirmation.get("order_id") or order_id,
+            "client_oid": confirmation.get("client_oid") or client_oid,
         }
 
     @staticmethod
