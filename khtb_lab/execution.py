@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,12 @@ class ExecutionEngine:
 
     TERMINAL_FILLED = {"filled"}
     TERMINAL_FAILED = {"cancelled", "canceled", "rejected"}
+    ACTIVE_STRATEGY_STATUSES = {
+        "live",
+        "not_trigger",
+        "pending",
+        "submitting",
+    }
 
     def __init__(self, settings):
         self.settings = settings
@@ -141,6 +148,175 @@ class ExecutionEngine:
         except Exception:
             log.exception("Account state fetch failed")
             return None
+
+    @staticmethod
+    def _normalized_symbol(symbol):
+        return str(symbol or "").split(":")[0].replace("/", "").upper()
+
+    @classmethod
+    def _exchange_position(cls, position):
+        if not isinstance(position, dict):
+            raise ValueError("exchange_position_not_an_object")
+
+        symbol = cls._normalized_symbol(position.get("symbol"))
+        if not symbol:
+            raise ValueError("exchange_position_missing_symbol")
+
+        quantity = None
+        for key in ("total", "size", "qty", "positionAmt", "positionSize"):
+            value = position.get(key)
+            if value is None:
+                continue
+            try:
+                quantity = float(value)
+            except (TypeError, ValueError):
+                raise ValueError("exchange_position_invalid_quantity")
+            break
+
+        if quantity is None:
+            raise ValueError("exchange_position_missing_quantity")
+        if not math.isfinite(quantity):
+            raise ValueError("exchange_position_invalid_quantity")
+        quantity = abs(quantity)
+        if quantity == 0:
+            return None
+
+        direction = str(
+            position.get("holdSide")
+            or position.get("posSide")
+            or position.get("side")
+            or ""
+        ).lower()
+        if direction in {"buy", "long"}:
+            direction = "LONG"
+        elif direction in {"sell", "short"}:
+            direction = "SHORT"
+        else:
+            raise ValueError("exchange_position_missing_direction")
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "quantity": quantity,
+        }
+
+    def reconcile_positions(self, local_trades):
+        """Fail closed unless recorded trades match exchange positions and protection."""
+        if not self.account or not self.ready:
+            return {
+                "ok": False,
+                "reason": "exchange_account_unavailable",
+                "mismatches": ["exchange_account_unavailable"],
+            }
+
+        try:
+            positions = self.account.current_positions()
+            strategy_orders = self.account.unfilled_strategy_orders()
+            if not isinstance(positions, list) or not isinstance(
+                strategy_orders, list
+            ):
+                raise ValueError("exchange_state_response_invalid")
+
+            live_positions = {}
+            for raw_position in positions:
+                position = self._exchange_position(raw_position)
+                if position is None:
+                    continue
+                key = (position["symbol"], position["direction"])
+                if key in live_positions:
+                    raise ValueError("duplicate_exchange_position")
+                live_positions[key] = position
+
+            tracked_trades = {}
+            environment = self.environment
+            for trade in local_trades:
+                if str(trade.get("source", "")).upper() != environment:
+                    continue
+                key = (
+                    self._normalized_symbol(trade.get("symbol")),
+                    str(trade.get("direction", "")).upper(),
+                )
+                if not key[0] or key[1] not in {"LONG", "SHORT"}:
+                    raise ValueError("local_trade_identity_invalid")
+                if key in tracked_trades:
+                    raise ValueError("duplicate_local_exchange_trade")
+                tracked_trades[key] = trade
+
+            mismatches = []
+            for key, position in live_positions.items():
+                trade = tracked_trades.get(key)
+                if trade is None:
+                    mismatches.append(
+                        f"untracked_exchange_position:{key[0]}:{key[1]}"
+                    )
+                    continue
+
+                expected_quantity = self._as_float(trade.get("qty"))
+                if expected_quantity <= 0 or abs(
+                    position["quantity"] - expected_quantity
+                ) > max(expected_quantity * 1e-6, 1e-8):
+                    mismatches.append(
+                        f"position_quantity_mismatch:{key[0]}:{key[1]}"
+                    )
+                    continue
+
+                matching_protection = [
+                    order
+                    for order in strategy_orders
+                    if isinstance(order, dict)
+                    and self._normalized_symbol(order.get("symbol")) == key[0]
+                    and str(order.get("status", "")).lower()
+                    in self.ACTIVE_STRATEGY_STATUSES
+                    and (
+                        str(
+                            getattr(self.settings, "position_mode", "one_way")
+                        ).lower()
+                        != "hedge"
+                        or str(
+                            order.get("posSide")
+                            or order.get("holdSide")
+                            or ""
+                        ).lower()
+                        == key[1].lower()
+                    )
+                    and self._same_decimal(
+                        order.get("stopLoss"), trade.get("stop")
+                    )
+                    and self._same_decimal(
+                        order.get("takeProfit"), trade.get("target")
+                    )
+                ]
+                if not matching_protection:
+                    mismatches.append(
+                        f"protection_unconfirmed:{key[0]}:{key[1]}"
+                    )
+
+            for key in tracked_trades:
+                if key not in live_positions:
+                    mismatches.append(
+                        f"recorded_position_missing_on_exchange:"
+                        f"{key[0]}:{key[1]}"
+                    )
+
+            return {
+                "ok": not mismatches,
+                "reason": (
+                    "exchange_state_matches"
+                    if not mismatches
+                    else "exchange_state_mismatch"
+                ),
+                "mismatches": mismatches,
+                "live_positions": len(live_positions),
+                "tracked_positions": len(tracked_trades),
+            }
+        except Exception as exc:
+            log.exception("Exchange position reconciliation failed")
+            reason = f"exchange_reconciliation_error:{type(exc).__name__}"
+            return {
+                "ok": False,
+                "reason": reason,
+                "mismatches": [reason],
+            }
 
     # ---------------------------------------------------------
     # Order preparation
@@ -292,7 +468,7 @@ class ExecutionEngine:
                         target,
                     )
                     status = str(order.get("status") or "").lower()
-                    active = status in {"pending", "submitting"}
+                    active = status in self.ACTIVE_STRATEGY_STATUSES
                     return {
                         "ok": active and stop_confirmed and target_confirmed,
                         "stop_confirmed": stop_confirmed,

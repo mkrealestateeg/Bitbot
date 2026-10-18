@@ -88,6 +88,22 @@ def test_tpsl_strategy_order_identifies_hedge_position_side():
     assert "reduceOnly" not in body
 
 
+def test_current_positions_rejects_unexpected_response_shape():
+    adapter, _ = _adapter()
+    adapter._signed_request = lambda *args, **kwargs: {}
+
+    with pytest.raises(RuntimeError, match="unexpected current-position"):
+        adapter.current_positions()
+
+
+def test_unfilled_strategy_orders_rejects_unexpected_response_shape():
+    adapter, _ = _adapter()
+    adapter._signed_request = lambda *args, **kwargs: {}
+
+    with pytest.raises(RuntimeError, match="unexpected strategy-order"):
+        adapter.unfilled_strategy_orders()
+
+
 def test_entry_order_rejection_logs_safe_parameters_not_credentials(caplog):
     adapter = BitgetUTAAdapter.__new__(BitgetUTAAdapter)
     adapter.settings = SimpleNamespace(

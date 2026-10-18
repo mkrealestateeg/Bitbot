@@ -718,8 +718,11 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             return data
         if isinstance(data, dict):
             orders = data.get("list")
-            return orders if isinstance(orders, list) else []
-        return []
+            if isinstance(orders, list):
+                return orders
+        raise RuntimeError(
+            "Bitget returned an unexpected strategy-order response"
+        )
 
     def order_info(
         self,
@@ -766,15 +769,19 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             "GET",
             "/api/v3/position/current-position",
             params=params,
-        ) or {}
+        )
 
         if isinstance(data, list):
             return data
 
         if isinstance(data, dict):
-            return data.get("list", [])
+            positions = data.get("list")
+            if isinstance(positions, list):
+                return positions
 
-        return []
+        raise RuntimeError(
+            "Bitget returned an unexpected current-position response"
+        )
 
     def close_all(self, symbol=None):
         body = {
