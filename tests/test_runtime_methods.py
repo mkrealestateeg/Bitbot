@@ -120,15 +120,25 @@ def test_telegram_close_does_not_close_record_when_exchange_rejects():
 
 
 @pytest.mark.parametrize(
-    ("demo_armed", "positions_reconciled", "expect_execute"),
+    (
+        "demo_armed",
+        "positions_reconciled",
+        "live_price",
+        "expect_execute",
+    ),
     [
-        (True, True, True),
-        (False, True, False),
-        (True, False, False),
+        (True, True, 101, True),
+        (False, True, 101, False),
+        (True, False, 101, False),
+        (True, True, 102, False),
     ],
 )
 def test_take_reaches_demo_execution_only_when_demo_gates_pass(
-    monkeypatch, demo_armed, positions_reconciled, expect_execute
+    monkeypatch,
+    demo_armed,
+    positions_reconciled,
+    live_price,
+    expect_execute,
 ):
     symbol = "BTC/USDT:USDT"
     signal = {
@@ -171,7 +181,7 @@ def test_take_reaches_demo_execution_only_when_demo_gates_pass(
     app.db = db
     app.market = SimpleNamespace(
         candles=lambda *args: [object()],
-        ticker=lambda symbol: {"last": 100},
+        ticker=lambda symbol: {"last": live_price},
     )
     app.mode = "AUTO"
     app.profile = "SAFE"
@@ -215,11 +225,18 @@ def test_take_reaches_demo_execution_only_when_demo_gates_pass(
 
     app._process_symbol(symbol, {}, allow_auto=True)
 
-    assert gate_calls
     assert bool(engine.execute_calls) is expect_execute
     if expect_execute:
+        assert gate_calls
         assert engine.execute_calls[0]["environment"] == "DEMO"
+        assert engine.execute_calls[0]["entry"] == 101
+        assert engine.execute_calls[0]["stop"] == 95
+        assert engine.execute_calls[0]["target"] == 110
+    elif live_price == 102:
+        assert not gate_calls
     elif not demo_armed:
+        assert gate_calls
         assert gate_calls[0] == (False, "DEMO_TRADING_ARMED=false")
-    else:
+    elif not positions_reconciled:
+        assert gate_calls
         assert gate_calls[0] == (False, "account_state_not_reconciled")

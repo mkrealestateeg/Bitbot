@@ -7,7 +7,7 @@ import time
 from .config import Settings
 from .database import Database
 from .market import Market
-from .strategy import analyze
+from .strategy import MIN_REWARD_RISK, analyze
 from .risk import risk_check, position_size
 from .paper import PaperBroker
 from .execution import ExecutionEngine
@@ -467,25 +467,33 @@ class KhtbLab:
                 if live_price <= 0 or live_price == float("inf"):
                     raise ValueError("Live ticker price is invalid")
 
-                # Move the planned entry to the current market price while
-                # preserving the original absolute SL/TP distances.
-                shift = live_price - original_entry
-
-                new_stop = original_stop + shift
-                new_target = original_target + shift
+                # Keep chart-derived levels fixed; reject entries that have
+                # already invalidated the structure or consumed target room.
+                new_stop = original_stop
+                new_target = original_target
 
                 if direction == "LONG" and not (
                     0 < new_stop < live_price < new_target
                 ):
                     raise ValueError(
-                        "Rebased LONG levels are invalid at live price"
+                        "Chart-based LONG levels are invalid at live price"
                     )
 
                 if direction == "SHORT" and not (
                     0 < new_target < live_price < new_stop
                 ):
                     raise ValueError(
-                        "Rebased SHORT levels are invalid at live price"
+                        "Chart-based SHORT levels are invalid at live price"
+                    )
+
+                risk_distance = abs(live_price - new_stop)
+                reward_distance = abs(new_target - live_price)
+                if (
+                    risk_distance <= 0
+                    or reward_distance / risk_distance < MIN_REWARD_RISK
+                ):
+                    raise ValueError(
+                        "Live entry leaves insufficient structural target room"
                     )
 
                 signal["price"] = live_price

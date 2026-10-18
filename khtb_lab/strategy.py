@@ -8,6 +8,11 @@ from .indicators import enrich
 
 MIN_TECH_SCORE = 65.0
 MIN_DIRECTION_GAP = 10.0
+STRUCTURE_LOOKBACK = 40
+STOP_BUFFER_ATR = 0.25
+MIN_STOP_DISTANCE_ATR = 0.5
+TARGET_BUFFER_ATR = 0.1
+MIN_REWARD_RISK = 1.5
 
 
 def _number(value, default=None):
@@ -50,28 +55,194 @@ def _candle_rejection(row, direction):
     return c < o and upper_wick >= body * 0.8
 
 
-def _make_candidate(direction, score, setup, reason, price, atr):
-    """Build a candidate with independent stop-loss and take-profit levels."""
+def _candle_pattern(main_df, direction):
+    """Return a simple, deterministic confirmation pattern for the signal candle."""
+    if len(main_df) < 3:
+        return None
+
+    candle = main_df.iloc[-2]
+    if _candle_rejection(candle, direction):
+        return f"{direction}_REJECTION"
+
+    previous = main_df.iloc[-3]
+    previous_open = _row_value(previous, "open")
+    previous_close = _row_value(previous, "close")
+    open_price = _row_value(candle, "open")
+    close_price = _row_value(candle, "close")
+
+    if None in (previous_open, previous_close, open_price, close_price):
+        return None
+
     if direction == "LONG":
-        stop = price - 1.5 * atr
-        target = price + 3.0 * atr
+        engulfing = (
+            previous_close < previous_open
+            and close_price > open_price
+            and open_price <= previous_close
+            and close_price >= previous_open
+        )
     else:
-        stop = price + 1.5 * atr
-        target = price - 3.0 * atr
+        engulfing = (
+            previous_close > previous_open
+            and close_price < open_price
+            and open_price >= previous_close
+            and close_price <= previous_open
+        )
+
+    return f"{direction}_ENGULFING" if engulfing else None
+
+
+def _swing_levels(history, column, side):
+    """Find recent confirmed pivots, retaining the range extreme as a fallback."""
+    values = [_number(value) for value in history[column].tolist()]
+    levels = []
+
+    for index in range(2, len(values) - 2):
+        value = values[index]
+        window = values[index - 2 : index + 3]
+        if value is None or any(item is None for item in window):
+            continue
+        if side == "low":
+            is_pivot = value <= min(window) and value < max(window)
+        else:
+            is_pivot = value >= max(window) and value > min(window)
+        if is_pivot:
+            levels.append(value)
+
+    valid_values = [value for value in values if value is not None]
+    if valid_values:
+        extreme = min(valid_values) if side == "low" else max(valid_values)
+        levels.append(extreme)
+    return sorted(set(levels))
+
+
+def _structural_levels(main_df, direction, price, atr, candle_pattern):
+    """Place exits beyond nearby chart structure and require room to the target."""
+    history = main_df.iloc[:-2].tail(STRUCTURE_LOOKBACK)
+    if len(history) < 20:
+        return None
+
+    supports = _swing_levels(history, "low", "low")
+    resistances = _swing_levels(history, "high", "high")
+
+    if candle_pattern:
+        signal_candle = main_df.iloc[-2]
+        pattern_level = _row_value(
+            signal_candle,
+            "low" if direction == "LONG" else "high",
+        )
+        if pattern_level is not None:
+            if direction == "LONG":
+                supports.append(pattern_level)
+            else:
+                resistances.append(pattern_level)
+
+    if direction == "LONG":
+        eligible_supports = [
+            level for level in supports
+            if level <= price - MIN_STOP_DISTANCE_ATR * atr
+        ]
+        if not eligible_supports:
+            return None
+        support = max(eligible_supports)
+        stop = support - STOP_BUFFER_ATR * atr
+        risk = price - stop
+        eligible_targets = sorted(
+            level - TARGET_BUFFER_ATR * atr
+            for level in resistances
+            if level - TARGET_BUFFER_ATR * atr
+            >= price + MIN_REWARD_RISK * risk
+        )
+        if eligible_targets:
+            target = eligible_targets[0]
+            target_basis = "swing resistance"
+        else:
+            range_low = _number(history["low"].min())
+            range_high = _number(history["high"].max())
+            range_width = (
+                range_high - range_low
+                if range_low is not None and range_high is not None
+                else 0
+            )
+            if range_high is None or price <= range_high or range_width <= 0:
+                return None
+            target = range_high + range_width - TARGET_BUFFER_ATR * atr
+            if target < price + MIN_REWARD_RISK * risk:
+                return None
+            target_basis = "measured range projection"
+        stop_basis = f"below swing low {support:.8g}"
+    else:
+        eligible_resistances = [
+            level for level in resistances
+            if level >= price + MIN_STOP_DISTANCE_ATR * atr
+        ]
+        if not eligible_resistances:
+            return None
+        resistance = min(eligible_resistances)
+        stop = resistance + STOP_BUFFER_ATR * atr
+        risk = stop - price
+        eligible_targets = sorted(
+            level + TARGET_BUFFER_ATR * atr
+            for level in supports
+            if level + TARGET_BUFFER_ATR * atr
+            <= price - MIN_REWARD_RISK * risk
+        )
+        if eligible_targets:
+            target = eligible_targets[-1]
+            target_basis = "swing support"
+        else:
+            range_low = _number(history["low"].min())
+            range_high = _number(history["high"].max())
+            range_width = (
+                range_high - range_low
+                if range_low is not None and range_high is not None
+                else 0
+            )
+            if range_low is None or price >= range_low or range_width <= 0:
+                return None
+            target = range_low - range_width + TARGET_BUFFER_ATR * atr
+            if target > price - MIN_REWARD_RISK * risk:
+                return None
+            target_basis = "measured range projection"
+        stop_basis = f"above swing high {resistance:.8g}"
+
+    if risk <= 0:
+        return None
+    return {
+        "stop": float(stop),
+        "target": float(target),
+        "risk_reward": float(abs(target - price) / risk),
+        "stop_basis": stop_basis,
+        "target_basis": target_basis,
+    }
+
+
+def _make_candidate(
+    direction, score, setup, reason, price, atr, main_df, candle_pattern=None
+):
+    """Build a candidate from nearby swing structure with an ATR safety buffer."""
+    levels = _structural_levels(
+        main_df, direction, price, atr, candle_pattern
+    )
+    if levels is None:
+        return None
 
     return {
         "direction": direction,
         "score": float(score),
         "price": float(price),
         "atr": float(atr),
-        "stop": float(stop),
-        "target": float(target),
+        **levels,
+        "candle_pattern": candle_pattern,
         "setup": setup,
-        "reason": reason,
+        "reason": (
+            f"{reason}; SL {levels['stop_basis']}; "
+            f"TP {levels['target_basis']}; "
+            f"R:R {levels['risk_reward']:.2f}"
+        ),
     }
 
 
-def _momentum_candidate(main, trend, context, price, atr):
+def _momentum_candidate(main_df, main, trend, context, price, atr):
     """Score the existing multi-timeframe momentum strategy."""
     score_long = 0.0
     score_short = 0.0
@@ -143,18 +314,18 @@ def _momentum_candidate(main, trend, context, price, atr):
     else:
         return None, max(score_long, score_short), reasons
 
-    return (
-        _make_candidate(
-            direction,
-            score,
-            "MOMENTUM",
-            "; ".join(reasons),
-            price,
-            atr,
-        ),
-        max(score_long, score_short),
-        reasons,
+    pattern = _candle_pattern(main_df, direction)
+    candidate = _make_candidate(
+        direction,
+        score,
+        "MOMENTUM",
+        "; ".join(reasons),
+        price,
+        atr,
+        main_df,
+        pattern,
     )
+    return candidate, max(score_long, score_short), reasons
 
 
 def _range_candidates(main_df, main, price, atr):
@@ -176,39 +347,45 @@ def _range_candidates(main_df, main, price, atr):
 
     if (
         abs(price - support) <= tolerance
-        and _candle_rejection(main, "LONG")
+        and _candle_pattern(main_df, "LONG")
     ):
-        candidates.append(
-            _make_candidate(
-                "LONG",
-                68,
-                "HORIZONTAL_RANGE",
-                (
-                    f"15m support rejection near {support:.8g}; "
-                    f"range resistance {resistance:.8g}"
-                ),
-                price,
-                atr,
-            )
+        pattern = _candle_pattern(main_df, "LONG")
+        candidate = _make_candidate(
+            "LONG",
+            68,
+            "HORIZONTAL_RANGE",
+            (
+                f"15m support rejection near {support:.8g}; "
+                f"range resistance {resistance:.8g}"
+            ),
+            price,
+            atr,
+            main_df,
+            pattern,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     if (
         abs(resistance - price) <= tolerance
-        and _candle_rejection(main, "SHORT")
+        and _candle_pattern(main_df, "SHORT")
     ):
-        candidates.append(
-            _make_candidate(
-                "SHORT",
-                68,
-                "HORIZONTAL_RANGE",
-                (
-                    f"15m resistance rejection near {resistance:.8g}; "
-                    f"range support {support:.8g}"
-                ),
-                price,
-                atr,
-            )
+        pattern = _candle_pattern(main_df, "SHORT")
+        candidate = _make_candidate(
+            "SHORT",
+            68,
+            "HORIZONTAL_RANGE",
+            (
+                f"15m resistance rejection near {resistance:.8g}; "
+                f"range support {support:.8g}"
+            ),
+            price,
+            atr,
+            main_df,
+            pattern,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     return candidates
 
@@ -252,23 +429,26 @@ def _brr_candidates(main_df, trend_df, main, price, atr):
     )
     low = _row_value(main, "low")
 
+    long_pattern = _candle_pattern(main_df, "LONG")
     if (
         breakout_long
         and low is not None
         and abs(low - resistance) <= retest_tolerance
         and price > resistance
-        and _candle_rejection(main, "LONG")
+        and long_pattern
     ):
-        candidates.append(
-            _make_candidate(
-                "LONG",
-                72,
-                "BRR",
-                f"15m bullish retest of 1h breakout level {resistance:.8g}",
-                price,
-                atr,
-            )
+        candidate = _make_candidate(
+            "LONG",
+            72,
+            "BRR",
+            f"15m bullish retest of 1h breakout level {resistance:.8g}",
+            price,
+            atr,
+            main_df,
+            long_pattern,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     # Short: recent breakdown below hourly support, then retest.
     breakout_short = any(
@@ -277,23 +457,26 @@ def _brr_candidates(main_df, trend_df, main, price, atr):
     )
     high = _row_value(main, "high")
 
+    short_pattern = _candle_pattern(main_df, "SHORT")
     if (
         breakout_short
         and high is not None
         and abs(high - support) <= retest_tolerance
         and price < support
-        and _candle_rejection(main, "SHORT")
+        and short_pattern
     ):
-        candidates.append(
-            _make_candidate(
-                "SHORT",
-                72,
-                "BRR",
-                f"15m bearish retest of 1h breakdown level {support:.8g}",
-                price,
-                atr,
-            )
+        candidate = _make_candidate(
+            "SHORT",
+            72,
+            "BRR",
+            f"15m bearish retest of 1h breakdown level {support:.8g}",
+            price,
+            atr,
+            main_df,
+            short_pattern,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     return candidates
 
@@ -349,7 +532,7 @@ def analyze(main_df, trend_df, context_df):
     candidates = []
 
     momentum, momentum_score, momentum_reasons = _momentum_candidate(
-        main, trend, context, price, atr
+        main_data, main, trend, context, price, atr
     )
     if momentum is not None:
         candidates.append(momentum)
