@@ -1,3 +1,5 @@
+import sqlite3
+
 from khtb_lab.database import Database
 
 def test_paper_trade_lifecycle_and_stats():
@@ -49,4 +51,68 @@ def test_trade_stop_sync_only_allows_monotonic_risk_reduction():
     assert not db.update_trade_stop(long_id,99)
     assert db.update_trade_stop(short_id,200)
     assert not db.update_trade_stop(short_id,201)
+    db.close()
+
+
+def test_trade_management_persists_virtual_target_stage_and_order_identity():
+    db=Database(':memory:')
+    trade_id=db.open_trade(
+        'BTC/USDT',
+        'LONG',
+        100,
+        95,
+        120,
+        2,
+        source='DEMO',
+        protection_order_id='tpsl-1',
+        protection_client_oid='tpsl-client',
+    )
+    trade=db.open_trades('DEMO')[0]
+
+    assert trade['initial_risk']==5
+    assert trade['favorable_price']==100
+    assert trade['protection_order_id']=='tpsl-1'
+    assert db.save_trade_management(trade_id,1,112,106,'tpsl-1','tpsl-client')
+    assert db.save_trade_management(trade_id,2,118,110)
+    assert not db.save_trade_management(trade_id,1,117,109)
+    assert not db.save_trade_management(trade_id,3,119,108)
+
+    updated=db.open_trades('DEMO')[0]
+    assert updated['management_stage']==2
+    assert updated['favorable_price']==118
+    assert updated['stop']==110
+    assert updated['target']==120
+    assert updated['protection_order_id']=='tpsl-1'
+    db.close()
+
+
+def test_existing_trade_database_is_migrated_with_safe_management_defaults(
+    tmp_path,
+):
+    database_path=tmp_path/'legacy.sqlite'
+    connection=sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE trades("
+        "id INTEGER PRIMARY KEY,ts_open TEXT NOT NULL,ts_close TEXT,"
+        "symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL NOT NULL,"
+        "stop REAL NOT NULL,target REAL NOT NULL,qty REAL NOT NULL,"
+        "status TEXT NOT NULL,mode TEXT NOT NULL,pnl REAL,r_multiple REAL,"
+        "source TEXT NOT NULL DEFAULT 'PAPER',close_reason TEXT,snapshot TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO trades("
+        "id,ts_open,symbol,direction,entry,stop,target,qty,status,mode,source"
+        ") VALUES(1,'2025-01-01T00:00:00+00:00','BTC/USDT','LONG',100,95,"
+        "120,1,'OPEN','AUTO','DEMO')"
+    )
+    connection.commit()
+    connection.close()
+
+    db=Database(str(database_path))
+    trade=db.open_trades('DEMO')[0]
+
+    assert trade['initial_risk']==5
+    assert trade['management_stage']==0
+    assert trade['favorable_price']==100
+    assert trade['protection_order_id'] is None
     db.close()

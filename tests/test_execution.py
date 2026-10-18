@@ -59,6 +59,8 @@ class _ExecutionAccount:
         self.calls = calls
         self.reject_entry = reject_entry
         self.tpsl_order = None
+        self.positions = []
+        self.ignore_empty_tp = False
 
     def set_leverage(self, symbol, leverage):
         self.calls.append("leverage")
@@ -77,6 +79,7 @@ class _ExecutionAccount:
     ):
         self.calls.append(("tpsl", stop, target))
         self.tpsl_order = {
+            "symbol": symbol.replace("/", ""),
             "orderId": "tpsl-1",
             "clientOid": client_oid,
             "status": "pending",
@@ -87,6 +90,18 @@ class _ExecutionAccount:
 
     def unfilled_strategy_orders(self):
         return [self.tpsl_order] if self.tpsl_order else []
+
+    def current_positions(self, symbol=None):
+        return self.positions
+
+    def modify_tpsl_order(
+        self, symbol, order_id, client_oid, quantity, stop, target, pos_side
+    ):
+        self.calls.append(("modify-tpsl", stop, target))
+        self.tpsl_order["stopLoss"] = stop
+        if target is not None or not self.ignore_empty_tp:
+            self.tpsl_order["takeProfit"] = target
+        return {"orderId": order_id, "clientOid": client_oid}
 
 
 def _executable_engine(reject_entry=False):
@@ -186,18 +201,24 @@ def test_position_reconciliation_requires_matching_live_position_and_protection(
             {
                 "symbol": "BTCUSDT",
                 "status": "live",
+                "orderId": "tpsl-1",
+                "clientOid": "tpsl-client",
                 "stopLoss": "95",
                 "takeProfit": "110",
             }
         ],
     )
     trade = {
+        "id": 5,
         "symbol": "BTC/USDT:USDT",
         "direction": "LONG",
         "qty": 0.1234,
+        "entry": 100,
         "stop": 95,
         "target": 110,
         "source": "DEMO",
+        "protection_order_id": "tpsl-1",
+        "protection_client_oid": "tpsl-client",
     }
 
     result = engine.reconcile_positions([trade])
@@ -226,6 +247,8 @@ def test_position_reconciliation_reports_only_safer_stop_changes():
         [{
             "symbol": "BTCUSDT",
             "status": "live",
+            "orderId": "tpsl-1",
+            "clientOid": "tracked-tpsl",
             "stopLoss": "100",
             "takeProfit": "110",
         }],
@@ -235,6 +258,7 @@ def test_position_reconciliation_reports_only_safer_stop_changes():
         "symbol": "BTC/USDT:USDT",
         "direction": "LONG",
         "qty": 0.1234,
+        "entry": 100,
         "stop": 95,
         "target": 110,
         "source": "DEMO",
@@ -243,7 +267,14 @@ def test_position_reconciliation_reports_only_safer_stop_changes():
     result = engine.reconcile_positions([trade])
 
     assert result["ok"] is True
-    assert result["protection_updates"] == [{"trade_id": 12, "stop": 100}]
+    assert result["protection_updates"] == [{
+        "trade_id": 12,
+        "stop": 100.0,
+        "management_stage": 0,
+        "favorable_price": 100.0,
+        "order_id": "tpsl-1",
+        "client_oid": "tracked-tpsl",
+    }]
 
 
 def test_position_reconciliation_fails_closed_on_missing_protection():
@@ -265,6 +296,46 @@ def test_position_reconciliation_fails_closed_on_missing_protection():
 
     assert result["ok"] is False
     assert result["mismatches"] == ["protection_unconfirmed:BTCUSDT:LONG"]
+
+
+def test_reconciliation_recovers_confirmed_virtual_tp2_after_restart():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount(
+        [{"symbol": "BTCUSDT", "holdSide": "long", "total": "0.5"}],
+        [{
+            "symbol": "BTCUSDT",
+            "orderId": "tpsl-1",
+            "clientOid": "tpsl-client",
+            "status": "live",
+            "stopLoss": "106",
+            "takeProfit": "",
+        }],
+    )
+    trade = {
+        "id": 8,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 0.5,
+        "entry": 100,
+        "stop": 105,
+        "target": 120,
+        "management_stage": 1,
+        "protection_order_id": "tpsl-1",
+        "protection_client_oid": "tpsl-client",
+        "source": "DEMO",
+    }
+
+    result = engine.reconcile_positions([trade])
+
+    assert result["ok"] is True
+    assert result["protection_updates"] == [{
+        "trade_id": 8,
+        "stop": 106.0,
+        "management_stage": 2,
+        "favorable_price": 100.0,
+        "order_id": "tpsl-1",
+        "client_oid": "tpsl-client",
+    }]
 
 
 def test_position_reconciliation_fails_closed_on_untracked_position():
@@ -290,6 +361,131 @@ def test_exchange_execution_gate_requires_successful_position_reconciliation():
 
     assert allowed is False
     assert reason == "account_state_not_reconciled"
+
+
+def test_tpsl_update_requires_unique_tracked_order_and_confirms_full_protection():
+    engine = _ready_demo_engine()
+    calls = []
+    order = {
+        "symbol": "BTCUSDT",
+        "orderId": "tpsl-1",
+        "clientOid": "tracked-tpsl",
+        "status": "live",
+        "stopLoss": "95",
+        "takeProfit": "110",
+    }
+    engine.account = _ExecutionAccount(calls)
+    engine.account.positions = [{
+        "symbol": "BTCUSDT",
+        "holdSide": "long",
+        "total": "0.5",
+    }]
+    engine.account.tpsl_order = order
+    trade = {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 0.5,
+        "stop": 95,
+        "target": 110,
+        "management_stage": 1,
+        "protection_order_id": "tpsl-1",
+        "protection_client_oid": "tracked-tpsl",
+    }
+
+    result = engine.update_tpsl_protection(trade, 105, None)
+
+    assert result["ok"] is True
+    assert result["stop_confirmed"] is True
+    assert result["target_confirmed"] is True
+    assert order["stopLoss"] == 105
+    assert order["takeProfit"] is None
+    assert calls == [("modify-tpsl", 105, None)]
+    assert engine.positions_reconciled is True
+
+
+def test_tpsl_update_fails_closed_when_matching_protection_is_ambiguous():
+    engine = _ready_demo_engine()
+    calls = []
+    engine.account = _ExecutionAccount(calls)
+    engine.account.positions = [{
+        "symbol": "BTCUSDT",
+        "holdSide": "long",
+        "total": "0.5",
+    }]
+    engine.account.tpsl_order = {
+        "symbol": "BTCUSDT",
+        "orderId": "tpsl-1",
+        "clientOid": "tracked-tpsl",
+        "status": "live",
+        "stopLoss": "95",
+        "takeProfit": "110",
+    }
+    engine.account.unfilled_strategy_orders = lambda: [
+        engine.account.tpsl_order,
+        {**engine.account.tpsl_order, "orderId": "tpsl-2"},
+    ]
+    trade = {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 0.5,
+        "stop": 95,
+        "target": 110,
+        "management_stage": 1,
+    }
+
+    result = engine.update_tpsl_protection(trade, 105, 110)
+
+    assert result == {
+        "ok": False,
+        "reason": "multiple_matching_protection_orders",
+    }
+    assert calls == []
+    assert engine.positions_reconciled is False
+
+
+def test_tpsl_update_fails_closed_if_exchange_does_not_remove_tp():
+    engine = _ready_demo_engine()
+    calls = []
+    engine.account = _ExecutionAccount(calls)
+    engine.account.positions = [{
+        "symbol": "BTCUSDT",
+        "holdSide": "long",
+        "total": "0.5",
+    }]
+    engine.account.tpsl_order = {
+        "symbol": "BTCUSDT",
+        "orderId": "tpsl-1",
+        "clientOid": "tracked-tpsl",
+        "status": "live",
+        "stopLoss": "95",
+        "takeProfit": "110",
+    }
+    engine.account.ignore_empty_tp = True
+    engine._reconcile_tpsl_order = lambda *args, **kwargs: {
+        "ok": False,
+        "reason": "updated_protection_not_confirmed",
+    }
+    trade = {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "entry": 100,
+        "qty": 0.5,
+        "stop": 95,
+        "target": 110,
+        "management_stage": 1,
+        "protection_order_id": "tpsl-1",
+        "protection_client_oid": "tracked-tpsl",
+    }
+
+    result = engine.update_tpsl_protection(trade, 105, None)
+
+    assert result["ok"] is False
+    assert engine.account.tpsl_order["stopLoss"] == 105
+    assert engine.account.tpsl_order["takeProfit"] == "110"
+    assert engine.positions_reconciled is False
 
 
 def test_failed_position_reconciliation_resets_execution_gate():

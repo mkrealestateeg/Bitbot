@@ -734,6 +734,69 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             or {}
         )
 
+    def modify_tpsl_order(
+        self,
+        symbol,
+        order_id,
+        client_oid,
+        quantity,
+        stop,
+        target,
+        pos_side=None,
+    ):
+        if not order_id and not client_oid:
+            raise ValueError(
+                "order_id or client_oid is required to modify TPSL"
+            )
+
+        stop_value = self._number(stop)
+        if stop_value is None or stop_value <= 0:
+            raise ValueError("Invalid stop-loss price")
+
+        target_value = self._number(target) if target is not None else None
+        if target is not None and (
+            target_value is None or target_value <= 0
+        ):
+            raise ValueError("Invalid take-profit price")
+
+        quantity_value = self._number(quantity)
+        if quantity_value is None or quantity_value <= 0:
+            raise ValueError("Invalid TPSL quantity")
+
+        body = {
+            "category": self.settings.product_category,
+            "symbol": self._symbol(symbol),
+            "orderId": str(order_id or ""),
+            "clientOid": str(client_oid or ""),
+            "qty": str(quantity),
+            "tpTriggerBy": "mark" if target_value is not None else "",
+            "slTriggerBy": "mark",
+            "takeProfit": (
+                str(target) if target_value is not None else ""
+            ),
+            "stopLoss": str(stop),
+            "tpOrderType": "market" if target_value is not None else "",
+            "slOrderType": "market",
+            "tpLimitPrice": "",
+            "slLimitPrice": "",
+        }
+        if self.settings.position_mode == "hedge":
+            normalized_pos_side = str(pos_side or "").lower()
+            if normalized_pos_side not in {"long", "short"}:
+                raise ValueError(
+                    "pos_side must be 'long' or 'short' in hedge mode"
+                )
+            body["posSide"] = normalized_pos_side
+
+        return (
+            self._signed_request(
+                "POST",
+                "/api/v3/trade/modify-strategy-order",
+                body=body,
+            )
+            or {}
+        )
+
     def unfilled_strategy_orders(self):
         data = self._signed_request(
             "GET",

@@ -88,6 +88,45 @@ def test_tpsl_strategy_order_identifies_hedge_position_side():
     assert "reduceOnly" not in body
 
 
+def test_modify_tpsl_can_remove_exchange_target_while_retaining_full_size_stop():
+    adapter, requests = _adapter()
+
+    adapter.modify_tpsl_order(
+        symbol="BTC/USDT:USDT",
+        order_id="tpsl-1",
+        client_oid="tpsl-oid",
+        quantity="0.25",
+        stop="105",
+        target=None,
+    )
+
+    method, path, _, body = requests[0]
+    assert method == "POST"
+    assert path == "/api/v3/trade/modify-strategy-order"
+    assert body["category"] == "USDT-FUTURES"
+    assert body["symbol"] == "BTCUSDT"
+    assert body["orderId"] == "tpsl-1"
+    assert body["qty"] == "0.25"
+    assert body["stopLoss"] == "105"
+    assert body["takeProfit"] == ""
+    assert body["slOrderType"] == "market"
+    assert body["tpOrderType"] == ""
+
+
+def test_modify_tpsl_requires_hedge_position_side():
+    adapter, _ = _adapter(position_mode="hedge")
+
+    with pytest.raises(ValueError, match="pos_side"):
+        adapter.modify_tpsl_order(
+            symbol="BTC/USDT",
+            order_id="tpsl-1",
+            client_oid="tpsl-oid",
+            quantity="0.25",
+            stop="105",
+            target=None,
+        )
+
+
 def test_current_positions_rejects_unexpected_response_shape():
     adapter, _ = _adapter()
     adapter._signed_request = lambda *args, **kwargs: {}
