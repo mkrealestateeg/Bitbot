@@ -18,5 +18,7 @@ The polling request serializes `allowed_updates` as JSON. This avoids the HTTP 4
 Set `EXCHANGE_ID` to a CCXT-supported exchange id and `EXCHANGE_NAME` to the display name. Use separate DEMO/LIVE keys.
 For Bitget UTA, market entries are precision-adjusted and confirmed filled before a separate full-position TPSL strategy order is submitted and checked against active strategy orders. Before each DEMO/LIVE scan, tracked positions, quantities, and active protection are reconciled against Bitget; any mismatch or unknown response blocks automatic entries for that scan. If protection is not confirmed, the bot reports the open position as unprotected; verify all behavior in DEMO before enabling LIVE.
 
+Telegram maintains one editable follow-up message per open trade and authorized chat, with an individual close button. A trade suppresses new opportunity alerts/entries only for its own symbol; other symbols continue to be scanned. Status refreshes follow the scan interval. PnL and exchange-close summaries are estimated gross values and exclude fees/funding. TP1 (1R) and near-target messages are alerts only; no partial exit or trailing-stop order is placed. Individual close buttons are disabled in hedge mode because the current close endpoint is symbol-scoped.
+
 ## Deployment
 Railway should run `python main.py`. Keep `TRADING_ENV=DEMO`, `DEMO_TRADING_ARMED=false`, and `LIVE_TRADING_ARMED=false` until a controlled DEMO test is explicitly started.

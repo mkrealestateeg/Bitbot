@@ -7,7 +7,8 @@ def risk_check(settings,db,signal,capital):
     if capital is None or capital<=0:return False,"Equity unavailable"
     if signal.get("direction") not in {"LONG","SHORT"}:return False,"No directional setup"
     if signal.get("score",0)<65:return False,"Technical score below 65"
-    if len(db.open_trades())>=settings.max_open_positions:return False,"Maximum open positions reached"
+    environment=str(getattr(settings,"trading_env","PAPER")).upper()
+    if len(db.open_trades(environment))>=settings.max_open_positions:return False,"Maximum open positions reached"
     if db.daily_pnl()<=-capital*settings.max_daily_loss:return False,"Daily loss limit reached"
     if not signal.get("stop") or not signal.get("target"):return False,"Missing stop or target"
     if signal["direction"]=="LONG" and not signal["stop"]<signal["price"]<signal["target"]:return False,"Invalid LONG levels"

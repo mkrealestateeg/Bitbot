@@ -2,7 +2,7 @@ from khtb_lab.risk import position_size, risk_check
 from types import SimpleNamespace
 
 class DB:
-    def open_trades(self): return []
+    def open_trades(self,source=None): return []
     def daily_pnl(self): return 0
 
 def test_position_size_respects_risk_budget():

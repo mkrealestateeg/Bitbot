@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 from .config import Settings
@@ -73,6 +74,180 @@ class KhtbLab:
                 self.telegram.broadcast(message)
             except Exception:
                 log.exception("TELEGRAM NOTIFICATION FAILED")
+
+    def current_price(self, symbol):
+        ticker = self.market.ticker(symbol)
+        price = float(ticker.get("last") or 0)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"Invalid live price for {symbol}")
+        return price
+
+    @staticmethod
+    def trade_pnl(trade, price):
+        direction = 1 if trade["direction"] == "LONG" else -1
+        return (float(price) - float(trade["entry"])) * float(
+            trade["qty"]
+        ) * direction
+
+    def trade_milestones(self, trade, price):
+        direction = 1 if trade["direction"] == "LONG" else -1
+        entry = float(trade["entry"])
+        stop = float(trade["stop"])
+        target = float(trade["target"])
+        risk = abs(entry - stop)
+        progress = (float(price) - entry) * direction
+        events = []
+        target_distance = abs(target - entry)
+        if target_distance > 0 and progress >= target_distance * 0.9:
+            events.append((
+                "near_target",
+                f"🎯 {trade['symbol']} اقترب من الهدف: "
+                f"السعر {price:.8g}، الهدف {target:.8g}.",
+            ))
+        if risk > 0 and progress >= risk:
+            events.append((
+                "tp1_reached",
+                f"✅ {trade['symbol']} وصل إلى TP1 (1R) عند "
+                f"{price:.8g}.",
+            ))
+        if (direction > 0 and stop >= entry) or (
+            direction < 0 and stop <= entry
+        ):
+            events.append((
+                "breakeven",
+                f"🛡 وقف {trade['symbol']} أصبح عند نقطة الدخول أو "
+                "في منطقة ربح.",
+            ))
+        return events
+
+    def close_trade_from_telegram(self, trade_id):
+        trade = next(
+            (
+                item
+                for item in self.db.open_trades(
+                    self.settings.trading_env
+                )
+                if int(item["id"]) == int(trade_id)
+            ),
+            None,
+        )
+        if trade is None:
+            return {"success": False, "error": "trade_is_not_open"}
+
+        try:
+            price = self.current_price(trade["symbol"])
+            if self.settings.trading_env == "PAPER":
+                pnl = self.paper.close_trade(trade, price)
+                if pnl is None:
+                    return {"success": False, "error": "trade_is_not_open"}
+            else:
+                result = self.execution.close_position(trade)
+                if not result.get("success"):
+                    return result
+                pnl = self.trade_pnl(trade, price)
+                close_reason = (
+                    "EXCHANGE_CLOSED_ESTIMATED"
+                    if result.get("already_closed")
+                    else "MANUAL_CLOSE_ESTIMATED"
+                )
+                if not self.db.close_trade(
+                    trade["id"],
+                    price,
+                    pnl,
+                    close_reason,
+                ):
+                    return {
+                        "success": False,
+                        "error": "trade_database_close_failed",
+                    }
+            closed_trade = next(
+                item
+                for item in self.db.recent_trades(10)
+                if int(item["id"]) == int(trade_id)
+            )
+            return {
+                "success": True,
+                "trade": closed_trade,
+                "price": price,
+                "pnl": pnl,
+                "reason": closed_trade.get("close_reason"),
+            }
+        except Exception as exc:
+            log.exception(
+                "Telegram individual trade close failed | trade_id=%s",
+                trade_id,
+            )
+            return {
+                "success": False,
+                "error": f"{type(exc).__name__}:{exc}",
+                "reconcile_required": True,
+            }
+
+    def _settle_missing_exchange_trades(self, reconciliation):
+        live_keys = reconciliation.get("live_position_keys")
+        if not isinstance(live_keys, list):
+            return 0
+        live_keys = {tuple(key) for key in live_keys}
+        settled = 0
+        for trade in self.db.open_trades(self.settings.trading_env):
+            key = (
+                self.execution._normalized_symbol(trade["symbol"]),
+                str(trade["direction"]).upper(),
+            )
+            if key in live_keys:
+                continue
+            try:
+                price = self.current_price(trade["symbol"])
+                pnl = self.trade_pnl(trade, price)
+                if not self.db.close_trade(
+                    trade["id"],
+                    price,
+                    pnl,
+                    "EXCHANGE_CLOSED_ESTIMATED",
+                ):
+                    continue
+                settled += 1
+                closed_trade = {
+                    **trade,
+                    "status": "CLOSED",
+                    "pnl": pnl,
+                    "close_reason": "EXCHANGE_CLOSED_ESTIMATED",
+                }
+                if self.telegram:
+                    self.telegram.publish_trade_status(
+                        closed_trade,
+                        price,
+                        pnl,
+                        closed=True,
+                        reason="Exchange position closed; estimated result",
+                    )
+                log.info(
+                    "EXCHANGE POSITION CLOSED; ESTIMATE RECORDED | "
+                    "trade_id=%s | symbol=%s | price=%s | pnl=%s",
+                    trade["id"],
+                    trade["symbol"],
+                    price,
+                    pnl,
+                )
+            except Exception:
+                log.exception(
+                    "Could not settle missing exchange position | "
+                    "trade_id=%s",
+                    trade["id"],
+                )
+        return settled
+
+    def _sync_exchange_protection(self, reconciliation):
+        for update in reconciliation.get("protection_updates", []):
+            if self.db.update_trade_stop(
+                update["trade_id"], update["stop"]
+            ):
+                log.info(
+                    "SAFER EXCHANGE STOP SYNCHRONIZED | trade_id=%s | "
+                    "stop=%s",
+                    update["trade_id"],
+                    update["stop"],
+                )
 
     def opportunity_text(self, symbol, signal, ai=None):
         ai = ai or {}
@@ -385,6 +560,18 @@ class KhtbLab:
             score,
         )
 
+        if any(
+            self.execution._normalized_symbol(trade["symbol"])
+            == self.execution._normalized_symbol(symbol)
+            for trade in self.db.open_trades(self.settings.trading_env)
+        ):
+            log.info(
+                "OPPORTUNITY SUPPRESSED | symbol=%s | "
+                "reason=position_lifecycle_active",
+                symbol,
+            )
+            return
+
         ai = self._review_ai(symbol, signal)
 
         if self.settings.notify_technical_opportunity:
@@ -465,8 +652,9 @@ class KhtbLab:
         )
 
         if any(
-            trade["symbol"] == symbol
-            for trade in self.db.open_trades()
+            self.execution._normalized_symbol(trade["symbol"])
+            == self.execution._normalized_symbol(symbol)
+            for trade in self.db.open_trades(self.settings.trading_env)
         ):
             log.info(
                 "ORDER SKIPPED | symbol=%s | reason=position_already_open",
@@ -621,8 +809,16 @@ class KhtbLab:
 
         if self.settings.trading_env != "PAPER":
             reconciliation = self.execution.reconcile_positions(
-                self.db.open_trades()
+                self.db.open_trades(self.settings.trading_env)
             )
+            self._sync_exchange_protection(reconciliation)
+            if not reconciliation.get("ok") and self._settle_missing_exchange_trades(
+                reconciliation
+            ):
+                reconciliation = self.execution.reconcile_positions(
+                    self.db.open_trades(self.settings.trading_env)
+                )
+                self._sync_exchange_protection(reconciliation)
             if not reconciliation.get("ok"):
                 errors += 1
                 allow_auto = False
@@ -667,21 +863,41 @@ class KhtbLab:
             try:
                 closed_trades = self.paper.mark(prices)
                 for trade_id, reason, pnl in closed_trades:
+                    closed_trade = next(
+                        (
+                            trade
+                            for trade in self.db.recent_trades(10)
+                            if int(trade["id"]) == int(trade_id)
+                        ),
+                        None,
+                    )
                     log.info(
                         "PAPER TRADE CLOSED | trade_id=%s | reason=%s | pnl=%s",
                         trade_id,
                         reason,
                         pnl,
                     )
-                    self.notify(
-                        f"🔴 PAPER TRADE CLOSED\n"
-                        f"Trade #{trade_id}\n"
-                        f"{reason}\n"
-                        f"PnL: {pnl:.6f}"
-                    )
+                    if self.telegram and closed_trade:
+                        self.telegram.publish_trade_status(
+                            closed_trade,
+                            prices[closed_trade["symbol"]],
+                            pnl,
+                            closed=True,
+                            reason=reason,
+                        )
+                    else:
+                        self.notify(
+                            f"🔴 PAPER TRADE CLOSED\n"
+                            f"Trade #{trade_id}\n"
+                            f"{reason}\n"
+                            f"PnL: {pnl:.6f}"
+                        )
             except Exception:
                 errors += 1
                 log.exception("PAPER POSITION MONITOR FAILED")
+
+        if self.telegram:
+            self.telegram.sync_open_trade_statuses()
 
         self.last_scan = time.strftime("%Y-%m-%d %H:%M:%S")
         self.last_result = (
@@ -737,7 +953,8 @@ class KhtbLab:
             f"AI Model: {self.settings.gemini_model}\n"
             f"Technical Threshold: {self.settings.ai_min_tech_score}\n"
             f"Symbols: {len(self.db.enabled_symbols())}\n"
-            f"Open Trades: {len(self.db.open_trades())}\n"
+            f"Open Trades: "
+            f"{len(self.db.open_trades(self.settings.trading_env))}\n"
             f"Equity: {equity if equity is not None else 0:.2f} USDT\n"
             f"Available: {available if available is not None else 0:.2f} USDT\n"
             f"Daily PnL: {self.db.daily_pnl():.4f}\n"
