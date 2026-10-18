@@ -817,8 +817,13 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
         if isinstance(data, dict):
             for key in ("list", "positions", "positionList"):
-                if key in data and isinstance(data[key], list):
-                    return data[key]
+                if key not in data:
+                    continue
+                positions = data[key]
+                if positions is None:
+                    return []
+                if isinstance(positions, list):
+                    return positions
 
         log.error(
             "BITGET CURRENT POSITIONS RESPONSE SHAPE INVALID | shape=%s",
