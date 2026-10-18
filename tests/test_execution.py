@@ -206,6 +206,33 @@ def test_position_reconciliation_requires_matching_live_position_and_protection(
     assert result["tracked_positions"] == 1
 
 
+def test_position_reconciliation_reports_only_safer_stop_changes():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount(
+        [{"symbol": "BTCUSDT", "holdSide": "long", "total": "0.1234"}],
+        [{
+            "symbol": "BTCUSDT",
+            "status": "live",
+            "stopLoss": "100",
+            "takeProfit": "110",
+        }],
+    )
+    trade = {
+        "id": 12,
+        "symbol": "BTC/USDT:USDT",
+        "direction": "LONG",
+        "qty": 0.1234,
+        "stop": 95,
+        "target": 110,
+        "source": "DEMO",
+    }
+
+    result = engine.reconcile_positions([trade])
+
+    assert result["ok"] is True
+    assert result["protection_updates"] == [{"trade_id": 12, "stop": 100}]
+
+
 def test_position_reconciliation_fails_closed_on_missing_protection():
     engine = _ready_demo_engine()
     engine.account = _ReconciliationAccount(
@@ -240,3 +267,80 @@ def test_position_reconciliation_fails_closed_on_untracked_position():
     assert result["mismatches"] == [
         "untracked_exchange_position:BTCUSDT:LONG"
     ]
+
+
+def test_individual_close_checks_exchange_state_before_submission():
+    engine = _ready_demo_engine()
+    engine.settings.position_mode = "one_way"
+
+    class _AmbiguousAccount:
+        def close_all(self, symbol=None):
+            raise AssertionError("Ambiguous close must not submit")
+
+        def current_positions(self, symbol=None):
+            return [
+                {"symbol": "BTCUSDT", "holdSide": "long", "total": "0.5"},
+                {"symbol": "BTCUSDT", "holdSide": "short", "total": "0.2"},
+            ]
+
+    engine.account = _AmbiguousAccount()
+    result = engine.close_position({
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 0.5,
+    })
+
+    assert result["success"] is False
+    assert result["error"] == "symbol_position_is_ambiguous"
+
+
+def test_individual_close_requires_one_way_position_and_exchange_confirmation():
+    engine = _ready_demo_engine()
+    engine.settings.position_mode = "one_way"
+
+    class _CloseAccount:
+        def __init__(self):
+            self.calls = 0
+
+        def current_positions(self, symbol=None):
+            self.calls += 1
+            if self.calls == 1:
+                return [{
+                    "symbol": "BTCUSDT",
+                    "holdSide": "long",
+                    "total": "0.5",
+                }]
+            return []
+
+        def close_all(self, symbol=None):
+            assert symbol == "BTC/USDT"
+            return {"success": True}
+
+    engine.account = _CloseAccount()
+    trade = {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 0.5,
+    }
+
+    result = engine.close_position(trade, timeout=1)
+
+    assert result == {"success": True, "already_closed": False}
+    assert engine.account.calls == 2
+
+
+def test_individual_close_is_blocked_for_hedge_mode():
+    engine = _ready_demo_engine()
+    engine.settings.position_mode = "hedge"
+
+    result = engine.close_position({
+        "id": 1,
+        "symbol": "BTC/USDT",
+        "direction": "LONG",
+        "qty": 1,
+    })
+
+    assert result["success"] is False
+    assert result["error"] == "individual_close_not_supported_in_hedge_mode"

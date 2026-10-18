@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from khtb_lab.app import KhtbLab
+from khtb_lab.database import Database
 from khtb_lab.execution import ExecutionEngine
 
 
@@ -15,10 +16,11 @@ def test_scan_once_processes_enabled_symbols_and_updates_status():
     app = KhtbLab.__new__(KhtbLab)
     app.db = SimpleNamespace(
         enabled_symbols=lambda: ["BTC/USDT", "ETH/USDT"],
-        open_trades=lambda: [],
+        open_trades=lambda source=None: [],
     )
     app.settings = SimpleNamespace(trading_env="DEMO")
     app.mode = "MANUAL"
+    app.telegram = None
     app.last_scan = "Never"
     app.last_result = "Not scanned"
     app.execution = SimpleNamespace(
@@ -43,7 +45,7 @@ def test_scan_once_blocks_auto_entries_when_exchange_state_is_unreconciled():
     app = KhtbLab.__new__(KhtbLab)
     app.db = SimpleNamespace(
         enabled_symbols=lambda: ["BTC/USDT"],
-        open_trades=lambda: [],
+        open_trades=lambda source=None: [],
     )
     app.settings = SimpleNamespace(trading_env="DEMO")
     app.mode = "AUTO"
@@ -66,3 +68,49 @@ def test_scan_once_blocks_auto_entries_when_exchange_state_is_unreconciled():
 
     assert processed == [False]
     assert result == "Completed scan; symbols=1; errors=1"
+
+
+def test_telegram_close_records_trade_only_after_exchange_confirmation():
+    app = KhtbLab.__new__(KhtbLab)
+    app.db = Database(":memory:")
+    app.settings = SimpleNamespace(trading_env="DEMO")
+    trade_id = app.db.open_trade(
+        "BTC/USDT", "LONG", 100, 95, 110, 2, source="DEMO"
+    )
+    close_calls = []
+    app.execution = SimpleNamespace(
+        close_position=lambda trade: close_calls.append(trade["id"])
+        or {"success": True, "already_closed": False}
+    )
+    app.current_price = lambda symbol: 104
+
+    result = app.close_trade_from_telegram(trade_id)
+
+    assert result["success"] is True
+    assert close_calls == [trade_id]
+    assert result["pnl"] == 8
+    assert app.db.open_trades("DEMO") == []
+    assert result["trade"]["close_reason"] == "MANUAL_CLOSE_ESTIMATED"
+    app.db.close()
+
+
+def test_telegram_close_does_not_close_record_when_exchange_rejects():
+    app = KhtbLab.__new__(KhtbLab)
+    app.db = Database(":memory:")
+    app.settings = SimpleNamespace(trading_env="DEMO")
+    trade_id = app.db.open_trade(
+        "BTC/USDT", "LONG", 100, 95, 110, 2, source="DEMO"
+    )
+    app.execution = SimpleNamespace(
+        close_position=lambda trade: {
+            "success": False,
+            "error": "close_submitted_but_position_still_open",
+        }
+    )
+    app.current_price = lambda symbol: 104
+
+    result = app.close_trade_from_telegram(trade_id)
+
+    assert result["success"] is False
+    assert len(app.db.open_trades("DEMO")) == 1
+    app.db.close()

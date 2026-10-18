@@ -243,6 +243,7 @@ class ExecutionEngine:
                 tracked_trades[key] = trade
 
             mismatches = []
+            protection_updates = []
             for key, position in live_positions.items():
                 trade = tracked_trades.get(key)
                 if trade is None:
@@ -280,16 +281,35 @@ class ExecutionEngine:
                         == key[1].lower()
                     )
                     and self._same_decimal(
-                        order.get("stopLoss"), trade.get("stop")
-                    )
-                    and self._same_decimal(
                         order.get("takeProfit"), trade.get("target")
                     )
                 ]
-                if not matching_protection:
+                safe_protection = []
+                old_stop = self._as_float(trade.get("stop"))
+                for order in matching_protection:
+                    new_stop = self._as_float(order.get("stopLoss"))
+                    if new_stop <= 0:
+                        continue
+                    if key[1] == "LONG" and new_stop >= old_stop:
+                        safe_protection.append((new_stop, order))
+                    elif key[1] == "SHORT" and new_stop <= old_stop:
+                        safe_protection.append((new_stop, order))
+
+                if not safe_protection:
                     mismatches.append(
                         f"protection_unconfirmed:{key[0]}:{key[1]}"
                     )
+                else:
+                    actual_stop, _ = (
+                        max(safe_protection, key=lambda item: item[0])
+                        if key[1] == "LONG"
+                        else min(safe_protection, key=lambda item: item[0])
+                    )
+                    if not self._same_decimal(actual_stop, old_stop):
+                        protection_updates.append({
+                            "trade_id": trade["id"],
+                            "stop": actual_stop,
+                        })
 
             for key in tracked_trades:
                 if key not in live_positions:
@@ -306,7 +326,12 @@ class ExecutionEngine:
                     else "exchange_state_mismatch"
                 ),
                 "mismatches": mismatches,
+                "protection_updates": protection_updates,
                 "live_positions": len(live_positions),
+                "live_position_keys": [
+                    [symbol, direction]
+                    for symbol, direction in live_positions
+                ],
                 "tracked_positions": len(tracked_trades),
             }
         except Exception as exc:
@@ -316,6 +341,103 @@ class ExecutionEngine:
                 "ok": False,
                 "reason": reason,
                 "mismatches": [reason],
+            }
+
+    def close_position(self, trade, timeout=10):
+        """Close one one-way-mode symbol position and verify its disappearance."""
+        if (
+            self.environment not in {"DEMO", "LIVE"}
+            or not self.ready
+            or self.account is None
+        ):
+            return {"success": False, "error": "exchange_not_ready"}
+        if str(getattr(self.settings, "position_mode", "")).lower() == "hedge":
+            return {
+                "success": False,
+                "error": "individual_close_not_supported_in_hedge_mode",
+            }
+
+        symbol = trade.get("symbol")
+        direction = str(trade.get("direction", "")).upper()
+        key = (self._normalized_symbol(symbol), direction)
+        if not key[0] or direction not in {"LONG", "SHORT"}:
+            return {"success": False, "error": "invalid_trade_identity"}
+
+        try:
+            positions = self.account.current_positions(symbol)
+            if not isinstance(positions, list):
+                raise ValueError("exchange_position_response_invalid")
+            normalized_positions = [
+                position
+                for position in (
+                    self._exchange_position(raw) for raw in positions
+                )
+                if position is not None
+            ]
+            same_symbol = [
+                position
+                for position in normalized_positions
+                if position["symbol"] == key[0]
+            ]
+            matching = [
+                position
+                for position in same_symbol
+                if position["direction"] == key[1]
+            ]
+            if not matching:
+                return {"success": True, "already_closed": True}
+            if len(matching) != 1 or len(same_symbol) != 1:
+                return {
+                    "success": False,
+                    "error": "symbol_position_is_ambiguous",
+                }
+
+            expected_quantity = self._as_float(trade.get("qty"))
+            actual_quantity = matching[0]["quantity"]
+            if expected_quantity <= 0 or abs(
+                expected_quantity - actual_quantity
+            ) > max(expected_quantity * 1e-6, 1e-8):
+                return {
+                    "success": False,
+                    "error": "position_quantity_mismatch",
+                }
+
+            self.account.close_all(symbol)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                remaining = self.account.current_positions(symbol)
+                if not isinstance(remaining, list):
+                    raise ValueError("exchange_position_response_invalid")
+                remaining_positions = [
+                    position
+                    for position in (
+                        self._exchange_position(raw) for raw in remaining
+                    )
+                    if position is not None
+                ]
+                if not any(
+                    position["symbol"] == key[0]
+                    and position["direction"] == key[1]
+                    for position in remaining_positions
+                ):
+                    return {"success": True, "already_closed": False}
+                time.sleep(1)
+
+            return {
+                "success": False,
+                "error": "close_submitted_but_position_still_open",
+                "reconcile_required": True,
+            }
+        except Exception as exc:
+            log.exception(
+                "INDIVIDUAL POSITION CLOSE FAILED | trade_id=%s | symbol=%s",
+                trade.get("id"),
+                symbol,
+            )
+            return {
+                "success": False,
+                "error": f"{type(exc).__name__}:{exc}",
+                "reconcile_required": True,
             }
 
     # ---------------------------------------------------------

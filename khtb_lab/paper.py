@@ -6,7 +6,7 @@ class PaperBroker:
         return self.db.open_trade(symbol,signal["direction"],signal["price"],signal["stop"],signal["target"],qty,mode=mode,source="PAPER",snapshot=signal.get("snapshot")) if qty>0 else None
     def mark(self,prices):
         closed=[]
-        for trade in self.db.open_trades():
+        for trade in self.db.open_trades("PAPER"):
             price=prices.get(trade["symbol"])
             if price is None:continue
             d=1 if trade["direction"]=="LONG" else -1;reason=None;exit_price=None
@@ -15,9 +15,16 @@ class PaperBroker:
             if reason:
                 pnl=(exit_price-trade["entry"])*trade["qty"]*d;self.db.close_trade(trade["id"],exit_price,pnl,reason);self.capital+=pnl;closed.append((trade["id"],reason,pnl))
         return closed
+    def close_trade(self,trade,price,reason="MANUAL_CLOSE"):
+        direction=1 if trade["direction"]=="LONG" else -1
+        pnl=(price-trade["entry"])*trade["qty"]*direction
+        if self.db.close_trade(trade["id"],price,pnl,reason):
+            self.capital+=pnl
+            return pnl
+        return None
     def close_all(self,prices,reason="MANUAL_CLOSE"):
         closed=[]
-        for trade in self.db.open_trades():
+        for trade in self.db.open_trades("PAPER"):
             p=prices.get(trade["symbol"])
             if p is None:continue
             d=1 if trade["direction"]=="LONG" else -1;pnl=(p-trade["entry"])*trade["qty"]*d;self.db.close_trade(trade["id"],p,pnl,reason);self.capital+=pnl;closed.append((trade["id"],pnl))

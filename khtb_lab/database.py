@@ -11,7 +11,18 @@ class Database:
         self.conn.executescript("""CREATE TABLE IF NOT EXISTS symbols(symbol TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,symbol TEXT NOT NULL,direction TEXT NOT NULL,price REAL,score REAL,setup TEXT,reason TEXT,snapshot TEXT);
         CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT,ts_open TEXT NOT NULL,ts_close TEXT,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL NOT NULL,stop REAL NOT NULL,target REAL NOT NULL,qty REAL NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL,pnl REAL,r_multiple REAL,source TEXT NOT NULL DEFAULT 'PAPER',close_reason TEXT,snapshot TEXT);
-        CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS daily_stats(day TEXT PRIMARY KEY,realized_pnl REAL NOT NULL DEFAULT 0,trades INTEGER NOT NULL DEFAULT 0);""");self.conn.commit()
+        CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS daily_stats(day TEXT PRIMARY KEY,realized_pnl REAL NOT NULL DEFAULT 0,trades INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS trade_followups(
+            trade_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER,
+            text_hash TEXT,
+            near_target INTEGER NOT NULL DEFAULT 0,
+            tp1_reached INTEGER NOT NULL DEFAULT 0,
+            breakeven INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(trade_id,chat_id)
+        );""");self.conn.commit()
     def seed_symbols(self,symbols):
         now=datetime.now(timezone.utc).isoformat()
         for s in symbols:self.conn.execute("INSERT OR IGNORE INTO symbols(symbol,enabled,added_at) VALUES(?,1,?)",(s,now))
@@ -27,13 +38,31 @@ class Database:
         cur=self.conn.execute("INSERT INTO signals(ts,symbol,direction,price,score,setup,reason,snapshot) VALUES(?,?,?,?,?,?,?,?)",(datetime.now(timezone.utc).isoformat(),symbol,direction,price,score,setup,reason,json.dumps(snapshot,default=str)));self.conn.commit();return cur.lastrowid
     def open_trade(self,symbol,direction,entry,stop,target,qty,mode="MANUAL",source="PAPER",snapshot=None):
         cur=self.conn.execute("INSERT INTO trades(ts_open,symbol,direction,entry,stop,target,qty,status,mode,source,snapshot) VALUES(?,?,?,?,?,?,?,'OPEN',?,?,?)",(datetime.now(timezone.utc).isoformat(),symbol,direction,entry,stop,target,qty,mode,source,json.dumps(snapshot or {},default=str)));self.conn.commit();return cur.lastrowid
+    def open_trades(self,source=None):
+        if source is None:return[dict(r) for r in self.conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")]
+        return[dict(r) for r in self.conn.execute("SELECT * FROM trades WHERE status='OPEN' AND source=? ORDER BY id",(str(source).upper(),))]
+    def trade_followup(self,trade_id,chat_id):
+        row=self.conn.execute("SELECT * FROM trade_followups WHERE trade_id=? AND chat_id=?",(trade_id,chat_id)).fetchone()
+        return dict(row) if row else None
+    def update_trade_stop(self,trade_id,stop):
+        row=self.conn.execute("SELECT direction,entry,stop FROM trades WHERE id=? AND status='OPEN'",(trade_id,)).fetchone()
+        if not row:return False
+        stop=float(stop)
+        if (row["direction"]=="LONG" and stop<row["stop"]) or (row["direction"]=="SHORT" and stop>row["stop"]):return False
+        cur=self.conn.execute("UPDATE trades SET stop=? WHERE id=? AND status='OPEN'",(stop,trade_id));self.conn.commit();return cur.rowcount>0
+    def save_trade_followup(self,trade_id,chat_id,message_id,text_hash):
+        self.conn.execute("INSERT INTO trade_followups(trade_id,chat_id,message_id,text_hash) VALUES(?,?,?,?) ON CONFLICT(trade_id,chat_id) DO UPDATE SET message_id=excluded.message_id,text_hash=excluded.text_hash",(trade_id,chat_id,message_id,text_hash));self.conn.commit()
+    def mark_trade_followup_event(self,trade_id,chat_id,event):
+        columns={"near_target":"near_target","tp1_reached":"tp1_reached","breakeven":"breakeven"}
+        column=columns.get(event)
+        if not column:raise ValueError(f"Unknown trade follow-up event: {event}")
+        self.conn.execute(f"INSERT INTO trade_followups(trade_id,chat_id,{column}) VALUES(?,?,1) ON CONFLICT(trade_id,chat_id) DO UPDATE SET {column}=1",(trade_id,chat_id));self.conn.commit()
     def close_trade(self,trade_id,exit_price,pnl,reason):
         row=self.conn.execute("SELECT entry,stop,direction FROM trades WHERE id=? AND status='OPEN'",(trade_id,)).fetchone()
         if not row:return False
         risk=abs(row["entry"]-row["stop"]);move=(exit_price-row["entry"])*(1 if row["direction"]=="LONG" else -1);r=move/risk if risk else 0.0;now=datetime.now(timezone.utc)
         self.conn.execute("UPDATE trades SET ts_close=?,status='CLOSED',pnl=?,r_multiple=?,close_reason=? WHERE id=?",(now.isoformat(),pnl,r,reason,trade_id))
         day=now.date().isoformat();self.conn.execute("INSERT INTO daily_stats(day,realized_pnl,trades) VALUES(?,?,1) ON CONFLICT(day) DO UPDATE SET realized_pnl=realized_pnl+excluded.realized_pnl,trades=trades+1",(day,pnl));self.conn.commit();return True
-    def open_trades(self):return[dict(r) for r in self.conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id")]
     def recent_trades(self,limit=10):return[dict(r) for r in self.conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?",(limit,))]
     def daily_pnl(self):
         row=self.conn.execute("SELECT realized_pnl FROM daily_stats WHERE day=?",(date.today().isoformat(),)).fetchone();return float(row[0]) if row else 0.0
