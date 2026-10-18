@@ -96,12 +96,53 @@ def test_current_positions_rejects_unexpected_response_shape():
         adapter.current_positions()
 
 
+@pytest.mark.parametrize("response", [None, [], {"list": []}, {"positions": []}])
+def test_current_positions_accepts_successful_empty_position_responses(
+    response,
+):
+    adapter, _ = _adapter()
+    adapter._signed_request = lambda *args, **kwargs: response
+
+    assert adapter.current_positions() == []
+
+
+def test_current_positions_accepts_position_list_wrapper():
+    adapter, _ = _adapter()
+    positions = [{"symbol": "BTCUSDT", "holdSide": "long", "total": "1"}]
+    adapter._signed_request = lambda *args, **kwargs: {"list": positions}
+
+    assert adapter.current_positions() == positions
+
+
+def test_invalid_position_response_logs_shape_without_values(caplog):
+    adapter, _ = _adapter()
+    adapter._signed_request = lambda *args, **kwargs: {
+        "unexpected": [{"apiKey": "must-not-log"}],
+    }
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="unexpected current-position"):
+            adapter.current_positions()
+
+    assert "BITGET CURRENT POSITIONS RESPONSE SHAPE INVALID" in caplog.text
+    assert "unexpected" in caplog.text
+    assert "must-not-log" not in caplog.text
+
+
 def test_unfilled_strategy_orders_rejects_unexpected_response_shape():
     adapter, _ = _adapter()
     adapter._signed_request = lambda *args, **kwargs: {}
 
     with pytest.raises(RuntimeError, match="unexpected strategy-order"):
         adapter.unfilled_strategy_orders()
+
+
+@pytest.mark.parametrize("response", [None, [], {"list": []}])
+def test_unfilled_strategy_orders_accepts_empty_success_responses(response):
+    adapter, _ = _adapter()
+    adapter._signed_request = lambda *args, **kwargs: response
+
+    assert adapter.unfilled_strategy_orders() == []
 
 
 def test_entry_order_rejection_logs_safe_parameters_not_credentials(caplog):

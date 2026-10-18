@@ -17,6 +17,7 @@ def _ready_demo_engine():
     engine.ready = True
     engine.account = object()
     engine.exchange = None
+    engine.positions_reconciled = True
     return engine
 
 
@@ -206,6 +207,18 @@ def test_position_reconciliation_requires_matching_live_position_and_protection(
     assert result["tracked_positions"] == 1
 
 
+def test_empty_exchange_state_is_a_successful_reconciliation():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount([], [])
+
+    result = engine.reconcile_positions([])
+
+    assert result["ok"] is True
+    assert result["live_positions"] == 0
+    assert result["live_position_keys"] == []
+    assert engine.positions_reconciled is True
+
+
 def test_position_reconciliation_reports_only_safer_stop_changes():
     engine = _ready_demo_engine()
     engine.account = _ReconciliationAccount(
@@ -267,6 +280,30 @@ def test_position_reconciliation_fails_closed_on_untracked_position():
     assert result["mismatches"] == [
         "untracked_exchange_position:BTCUSDT:LONG"
     ]
+
+
+def test_exchange_execution_gate_requires_successful_position_reconciliation():
+    engine = _ready_demo_engine()
+    engine.positions_reconciled = False
+
+    allowed, reason = engine.can_execute()
+
+    assert allowed is False
+    assert reason == "account_state_not_reconciled"
+
+
+def test_failed_position_reconciliation_resets_execution_gate():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount([], [])
+    engine.account.current_positions = lambda: (_ for _ in ()).throw(
+        RuntimeError("account unavailable")
+    )
+
+    result = engine.reconcile_positions([])
+
+    assert result["ok"] is False
+    assert engine.positions_reconciled is False
+    assert engine.can_execute() == (False, "account_state_not_reconciled")
 
 
 def test_individual_close_checks_exchange_state_before_submission():
