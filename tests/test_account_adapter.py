@@ -96,7 +96,18 @@ def test_current_positions_rejects_unexpected_response_shape():
         adapter.current_positions()
 
 
-@pytest.mark.parametrize("response", [None, [], {"list": []}, {"positions": []}])
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [],
+        {"list": None},
+        {"positions": None},
+        {"positionList": None},
+        {"list": []},
+        {"positions": []},
+    ],
+)
 def test_current_positions_accepts_successful_empty_position_responses(
     response,
 ):
