@@ -619,6 +619,34 @@ class KhtbLab:
         prices = {}
         errors = 0
 
+        if self.settings.trading_env != "PAPER":
+            reconciliation = self.execution.reconcile_positions(
+                self.db.open_trades()
+            )
+            if not reconciliation.get("ok"):
+                errors += 1
+                allow_auto = False
+                log.critical(
+                    "AUTO EXECUTION BLOCKED | exchange_state=%s | "
+                    "mismatches=%s",
+                    reconciliation.get("reason"),
+                    reconciliation.get("mismatches"),
+                )
+                if self.mode == "AUTO":
+                    self.notify(
+                        "🚨 AUTO TRADING PAUSED FOR THIS SCAN\n"
+                        "Bitget positions/protection do not match the "
+                        "bot's recorded trades, or reconciliation failed.\n"
+                        f"Details: {reconciliation.get('mismatches')}\n"
+                        "Check open positions and SL/TP on Bitget. "
+                        "No new automatic entries will be submitted."
+                    )
+            else:
+                log.info(
+                    "EXCHANGE STATE RECONCILED | positions=%s",
+                    reconciliation.get("live_positions", 0),
+                )
+
         log.info(
             "SCAN CYCLE START | symbols=%s | env=%s | mode=%s | "
             "allow_auto=%s",

@@ -157,3 +157,86 @@ def test_parameter_rejection_is_reported_without_order_reconciliation():
     assert result["success"] is False
     assert result["reconcile_required"] is False
     assert "25200" in result["error"]
+
+
+class _ReconciliationAccount:
+    def __init__(self, positions, strategy_orders):
+        self.positions = positions
+        self.strategy_orders = strategy_orders
+
+    def current_positions(self):
+        return self.positions
+
+    def unfilled_strategy_orders(self):
+        return self.strategy_orders
+
+
+def test_position_reconciliation_requires_matching_live_position_and_protection():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "holdSide": "long",
+                "total": "0.1234",
+            }
+        ],
+        [
+            {
+                "symbol": "BTCUSDT",
+                "status": "live",
+                "stopLoss": "95",
+                "takeProfit": "110",
+            }
+        ],
+    )
+    trade = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "LONG",
+        "qty": 0.1234,
+        "stop": 95,
+        "target": 110,
+        "source": "DEMO",
+    }
+
+    result = engine.reconcile_positions([trade])
+
+    assert result["ok"] is True
+    assert result["live_positions"] == 1
+    assert result["tracked_positions"] == 1
+
+
+def test_position_reconciliation_fails_closed_on_missing_protection():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount(
+        [{"symbol": "BTCUSDT", "holdSide": "long", "total": "0.1234"}],
+        [],
+    )
+    trade = {
+        "symbol": "BTC/USDT:USDT",
+        "direction": "LONG",
+        "qty": 0.1234,
+        "stop": 95,
+        "target": 110,
+        "source": "DEMO",
+    }
+
+    result = engine.reconcile_positions([trade])
+
+    assert result["ok"] is False
+    assert result["mismatches"] == ["protection_unconfirmed:BTCUSDT:LONG"]
+
+
+def test_position_reconciliation_fails_closed_on_untracked_position():
+    engine = _ready_demo_engine()
+    engine.account = _ReconciliationAccount(
+        [{"symbol": "BTCUSDT", "holdSide": "long", "total": "0.1234"}],
+        [],
+    )
+
+    result = engine.reconcile_positions([])
+
+    assert result["ok"] is False
+    assert result["mismatches"] == [
+        "untracked_exchange_position:BTCUSDT:LONG"
+    ]
