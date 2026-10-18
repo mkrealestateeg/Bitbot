@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+
+import khtb_lab.app as app_module
 from khtb_lab.app import KhtbLab
 from khtb_lab.database import Database
 from khtb_lab.execution import ExecutionEngine
@@ -114,3 +117,109 @@ def test_telegram_close_does_not_close_record_when_exchange_rejects():
     assert result["success"] is False
     assert len(app.db.open_trades("DEMO")) == 1
     app.db.close()
+
+
+@pytest.mark.parametrize(
+    ("demo_armed", "positions_reconciled", "expect_execute"),
+    [
+        (True, True, True),
+        (False, True, False),
+        (True, False, False),
+    ],
+)
+def test_take_reaches_demo_execution_only_when_demo_gates_pass(
+    monkeypatch, demo_armed, positions_reconciled, expect_execute
+):
+    symbol = "BTC/USDT:USDT"
+    signal = {
+        "direction": "LONG",
+        "score": 80,
+        "price": 100,
+        "stop": 95,
+        "target": 110,
+        "setup": "TEST",
+        "reason": "test signal",
+        "snapshot": {},
+    }
+    monkeypatch.setattr(app_module, "analyze", lambda *args: signal.copy())
+    monkeypatch.setattr(
+        app_module, "risk_check", lambda *args: (True, "Risk checks passed")
+    )
+
+    settings = SimpleNamespace(
+        trading_env="DEMO",
+        timeframe_main="15m",
+        timeframe_trend="1h",
+        timeframe_context="4h",
+        ai_min_tech_score=65,
+        notify_technical_opportunity=False,
+        notify_auto_ready=False,
+        risk_per_trade=0.01,
+        max_margin_per_trade=50,
+        leverage=2,
+        enable_exchange_orders=True,
+        demo_armed=demo_armed,
+        live_armed=False,
+        position_mode="one_way",
+    )
+    db = SimpleNamespace(
+        save_signal=lambda *args: None,
+        open_trades=lambda source=None: [],
+    )
+    app = KhtbLab.__new__(KhtbLab)
+    app.settings = settings
+    app.db = db
+    app.market = SimpleNamespace(
+        candles=lambda *args: [object()],
+        ticker=lambda symbol: {"last": 100},
+    )
+    app.mode = "AUTO"
+    app.profile = "SAFE"
+    app.notify = lambda message: None
+    app._review_ai = lambda symbol, candidate: {
+        "decision": "TAKE",
+        "status": "OK",
+        "confidence": 90,
+    }
+
+    engine = ExecutionEngine.__new__(ExecutionEngine)
+    engine.settings = settings
+    engine.environment = "DEMO"
+    engine.ready = True
+    engine.account = object()
+    engine.exchange = None
+    engine.positions_reconciled = positions_reconciled
+    gate_calls = []
+    original_can_execute = engine.can_execute
+
+    def can_execute():
+        result = original_can_execute()
+        gate_calls.append(result)
+        return result
+
+    engine.can_execute = can_execute
+    engine.equity = lambda: 1000
+    engine.execute_calls = []
+
+    def execute(plan):
+        engine.execute_calls.append(plan)
+        return {
+            "success": False,
+            "executed": False,
+            "error": "test stub; no order submitted",
+            "reconcile_required": False,
+        }
+
+    engine.execute = execute
+    app.execution = engine
+
+    app._process_symbol(symbol, {}, allow_auto=True)
+
+    assert gate_calls
+    assert bool(engine.execute_calls) is expect_execute
+    if expect_execute:
+        assert engine.execute_calls[0]["environment"] == "DEMO"
+    elif not demo_armed:
+        assert gate_calls[0] == (False, "DEMO_TRADING_ARMED=false")
+    else:
+        assert gate_calls[0] == (False, "account_state_not_reconciled")

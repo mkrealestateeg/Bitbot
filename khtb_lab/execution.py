@@ -31,6 +31,7 @@ class ExecutionEngine:
         self.exchange = None
         self.account = None
         self.ready = False
+        self.positions_reconciled = False
 
         if self.environment == "PAPER":
             return
@@ -112,6 +113,9 @@ class ExecutionEngine:
 
         if not self.ready or self.account is None:
             return False, "exchange_not_ready"
+
+        if not self.positions_reconciled:
+            return False, "account_state_not_reconciled"
 
         return True, "ready"
 
@@ -202,6 +206,7 @@ class ExecutionEngine:
 
     def reconcile_positions(self, local_trades):
         """Fail closed unless recorded trades match exchange positions and protection."""
+        self.positions_reconciled = False
         if not self.account or not self.ready:
             return {
                 "ok": False,
@@ -318,7 +323,7 @@ class ExecutionEngine:
                         f"{key[0]}:{key[1]}"
                     )
 
-            return {
+            result = {
                 "ok": not mismatches,
                 "reason": (
                     "exchange_state_matches"
@@ -334,7 +339,10 @@ class ExecutionEngine:
                 ],
                 "tracked_positions": len(tracked_trades),
             }
+            self.positions_reconciled = result["ok"]
+            return result
         except Exception as exc:
+            self.positions_reconciled = False
             log.exception("Exchange position reconciliation failed")
             reason = f"exchange_reconciliation_error:{type(exc).__name__}"
             return {

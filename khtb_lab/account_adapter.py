@@ -253,6 +253,36 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
 
         return [type(value).__name__]
 
+    @classmethod
+    def _safe_response_shape(cls, value):
+        """Describe response structure without logging response values."""
+        shape = {"type": type(value).__name__}
+        if isinstance(value, dict):
+            shape["keys"] = sorted(str(key) for key in value)
+            for key in ("list", "positions", "positionList"):
+                if key not in value:
+                    continue
+                nested = value[key]
+                shape[key] = {
+                    "type": type(nested).__name__,
+                    "length": len(nested) if isinstance(nested, list) else None,
+                    "item_keys": (
+                        sorted(str(item_key) for item_key in nested[0])
+                        if isinstance(nested, list)
+                        and nested
+                        and isinstance(nested[0], dict)
+                        else None
+                    ),
+                }
+        elif isinstance(value, list):
+            shape["length"] = len(value)
+            shape["item_keys"] = (
+                sorted(str(key) for key in value[0])
+                if value and isinstance(value[0], dict)
+                else None
+            )
+        return shape
+
     @staticmethod
     def _find_usdt_asset(data):
         """
@@ -714,12 +744,19 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             },
         )
 
+        if data is None:
+            return []
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
             orders = data.get("list")
             if isinstance(orders, list):
                 return orders
+        log.error(
+            "BITGET UNFILLED STRATEGY ORDERS RESPONSE SHAPE INVALID | "
+            "shape=%s",
+            self._safe_response_shape(data),
+        )
         raise RuntimeError(
             "Bitget returned an unexpected strategy-order response"
         )
@@ -771,14 +808,22 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             params=params,
         )
 
+        # A successful UTA response may have a null data field when there
+        # are no positions. _signed_request has already validated code=00000.
+        if data is None:
+            return []
         if isinstance(data, list):
             return data
 
         if isinstance(data, dict):
-            positions = data.get("list")
-            if isinstance(positions, list):
-                return positions
+            for key in ("list", "positions", "positionList"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
 
+        log.error(
+            "BITGET CURRENT POSITIONS RESPONSE SHAPE INVALID | shape=%s",
+            self._safe_response_shape(data),
+        )
         raise RuntimeError(
             "Bitget returned an unexpected current-position response"
         )
