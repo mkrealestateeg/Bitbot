@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from decimal import Decimal
 
@@ -1383,6 +1384,8 @@ class KhtbLab:
 
     def run(self, telegram=None):
         self.telegram = telegram
+        stop_event = threading.Event()
+        telegram_thread = None
 
         log.info(
             "KHTB LAB STARTED | env=%s | mode=%s | exchange=%s",
@@ -1391,16 +1394,43 @@ class KhtbLab:
             self.settings.exchange_name,
         )
 
-        while True:
-            try:
-                if telegram:
-                    telegram.poll_once()
-            except Exception:
-                log.exception("TELEGRAM POLLING FAILED")
+        if telegram:
+            def telegram_worker():
+                while not stop_event.is_set():
+                    try:
+                        if not getattr(telegram, "started", False):
+                            if not telegram.startup():
+                                stop_event.wait(3)
+                                continue
+                        telegram.poll_once()
+                    except Exception:
+                        log.exception("TELEGRAM POLLING FAILED")
+                        stop_event.wait(1)
+                    else:
+                        stop_event.wait(0.3)
 
-            try:
-                self.scan_once(allow_auto=True)
-            except Exception:
-                log.exception("SCAN CYCLE FAILED")
+            telegram_thread = threading.Thread(
+                target=telegram_worker,
+                name="TelegramWorker",
+                daemon=True,
+            )
+            telegram_thread.start()
+            log.info("Telegram background polling thread launched")
 
-            time.sleep(max(5, self.settings.scan_seconds))
+        try:
+            while not stop_event.is_set():
+                try:
+                    self.scan_once(allow_auto=True)
+                except Exception:
+                    log.exception("SCAN CYCLE FAILED")
+
+                stop_event.wait(max(5, self.settings.scan_seconds))
+        finally:
+            stop_event.set()
+            if telegram_thread:
+                telegram_thread.join(timeout=2)
+                if telegram_thread.is_alive():
+                    log.warning(
+                        "Telegram polling thread is still stopping after "
+                        "shutdown request"
+                    )

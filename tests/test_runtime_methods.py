@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,46 @@ def test_runtime_methods_are_available_on_their_classes():
     assert callable(KhtbLab.scan_once)
     assert callable(KhtbLab._process_symbol)
     assert callable(ExecutionEngine.execute)
+
+
+def test_run_polls_telegram_in_background_and_stops_worker_on_exit():
+    app = KhtbLab.__new__(KhtbLab)
+    app.settings = SimpleNamespace(
+        trading_env="DEMO",
+        exchange_name="Bitget",
+        scan_seconds=5,
+    )
+    app.mode = "MANUAL"
+    poll_finished = threading.Event()
+    poll_threads = []
+
+    class _Telegram:
+        started = False
+
+        def startup(self):
+            self.started = True
+            return True
+
+        def poll_once(self):
+            poll_threads.append(threading.current_thread().name)
+            poll_finished.set()
+
+    def stop_after_poll(allow_auto):
+        if not poll_finished.wait(timeout=2):
+            raise AssertionError("Telegram polling stalled")
+        raise KeyboardInterrupt()
+
+    app.scan_once = stop_after_poll
+
+    with pytest.raises(KeyboardInterrupt):
+        app.run(_Telegram())
+
+    assert poll_threads == ["TelegramWorker"]
+    assert app.telegram.started is True
+    assert not any(
+        thread.name == "TelegramWorker" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 def test_scan_once_processes_enabled_symbols_and_updates_status():
