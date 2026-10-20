@@ -71,10 +71,10 @@ def _app(price, target=120, monotonic_lows=False):
     return app, calls
 
 
-def test_profit_lock_starts_only_at_ten_percent_of_position_notional():
-    app, calls = _app(price=108)
+def test_profit_lock_stays_inactive_before_one_r_of_initial_risk():
+    app, calls = _app(price=104)
     frame = _candles(monotonic_lows=True)
-    frame["high"] = frame["high"].clip(upper=109.99)
+    frame["high"] = frame["high"].clip(upper=104.99)
     app.market.candles = lambda symbol, timeframe, limit: frame
 
     assert app._manage_exchange_trades() is True
@@ -82,6 +82,43 @@ def test_profit_lock_starts_only_at_ten_percent_of_position_notional():
     trade = app.db.open_trades("DEMO")[0]
     assert trade["management_stage"] == 0
     assert trade["stop"] == 95
+    assert calls == []
+    app.db.close()
+
+
+def test_profit_lock_activates_at_one_r_without_using_leverage_or_margin():
+    app, calls = _app(price=105, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=105)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+    app.settings.leverage = 30
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["favorable_price"] == 105
+    assert trade["stop"] == 95
+    assert calls == []
+    app.db.close()
+
+
+def test_profit_lock_uses_saved_initial_risk_not_a_manually_changed_stop():
+    app, calls = _app(price=104, monotonic_lows=True)
+    app.db.conn.execute(
+        "UPDATE trades SET stop=103 WHERE status='OPEN'"
+    )
+    app.db.conn.commit()
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=104.99)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["initial_risk"] == 5
+    assert trade["management_stage"] == 0
+    assert trade["stop"] == 103
     assert calls == []
     app.db.close()
 
