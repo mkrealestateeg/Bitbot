@@ -296,10 +296,12 @@ class KhtbLab:
                 if direction not in {"LONG", "SHORT"}:
                     raise ValueError("invalid_position_direction")
                 entry = float(trade["entry"])
-                quantity = float(trade["qty"])
-                notional = entry * quantity
-                if notional <= 0:
-                    raise ValueError("invalid_position_notional")
+                initial_risk = float(
+                    trade.get("initial_risk")
+                    or abs(entry - float(trade["stop"]))
+                )
+                if not math.isfinite(initial_risk) or initial_risk <= 0:
+                    raise ValueError("invalid_initial_trade_risk")
 
                 stage = int(trade.get("management_stage") or 0)
                 favorable = self._favorable_price_from_candles(
@@ -312,8 +314,7 @@ class KhtbLab:
                 favorable_progress = (
                     (favorable - entry) * signed_direction
                 )
-                favorable_pnl = favorable_progress * quantity
-                pnl_on_notional = favorable_pnl / notional
+                risk_multiple = favorable_progress / initial_risk
                 target_distance = (
                     (float(trade["target"]) - entry)
                     * (1 if direction == "LONG" else -1)
@@ -323,19 +324,19 @@ class KhtbLab:
 
                 stop = float(trade["stop"])
                 just_activated = False
-                if stage == 0 and pnl_on_notional >= 0.10:
+                if stage == 0 and risk_multiple >= 1.0:
                     stage = self.PROFIT_LOCK_STAGE
                     just_activated = True
                     log.info(
                         "STRUCTURAL TRAILING ACTIVATED | trade_id=%s | "
-                        "symbol=%s | pnl_on_notional=%.4f",
+                        "symbol=%s | favorable_r=%.4f",
                         trade["id"],
                         trade["symbol"],
-                        pnl_on_notional,
+                        risk_multiple,
                     )
                     self.notify(
-                        f"🛡 {trade['symbol']} وصل الربح العائم إلى "
-                        f"{pnl_on_notional:.1%} من قيمة المركز؛ بدأ تتبع "
+                        f"🛡 {trade['symbol']} وصل إلى "
+                        f"{risk_multiple:.2f}R من المخاطرة الأصلية؛ بدأ تتبع "
                         "الوقف خلف القمم/القيعان المؤكدة."
                     )
 
