@@ -178,6 +178,38 @@ def test_profit_lock_trigger_reached_but_market_has_crossed_lock_price():
     app.db.close()
 
 
+def test_tp1_lock_moves_stop_to_one_r_after_an_extra_ten_percent_roe():
+    app, calls = _app(price=105.4, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=105.4)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["stop"] == 105
+    assert len(calls) == 1
+    assert calls[0][1] == 105
+    assert calls[0][2] == 120
+    app.db.close()
+
+
+def test_tp1_lock_waits_for_ten_percent_roe_extension_after_tp1():
+    app, calls = _app(price=105.3, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=105.3)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert 100 < trade["stop"] < 105
+    assert calls[0][1] == trade["stop"]
+    app.db.close()
+
+
 def test_unreconciled_position_is_never_managed():
     app, calls = _app(price=118)
     app.execution.positions_reconciled = False
@@ -195,19 +227,19 @@ def test_unreconciled_position_is_never_managed():
 
 
 def test_confirmed_swing_ratchets_stop_without_changing_full_position_or_tp2():
-    app, calls = _app(price=115)
+    app, calls = _app(price=120.5)
     original = app.db.open_trades("DEMO")[0]
 
     assert app._manage_exchange_trades() is True
 
     trade = app.db.open_trades("DEMO")[0]
-    assert trade["management_stage"] == 1
-    assert 100 < trade["stop"] < 115
+    assert trade["management_stage"] == 3
+    assert 100 < trade["stop"] < 120.5
     assert trade["qty"] == original["qty"]
     assert trade["target"] == original["target"]
     assert len(calls) == 1
     assert calls[0][1] == trade["stop"]
-    assert calls[0][2] == original["target"]
+    assert calls[0][2] is None
     app.db.close()
 
 
@@ -226,17 +258,49 @@ def test_virtual_tp2_removal_requires_profitable_structural_stop_confirmation():
     app.db.close()
 
 
-def test_tp2_remains_active_until_a_profitable_confirmed_swing_exists():
+def test_tp2_exchange_target_is_removed_before_price_can_extend_beyond_tp2():
     app, calls = _app(price=119, monotonic_lows=True)
 
     assert app._manage_exchange_trades() is True
 
     trade = app.db.open_trades("DEMO")[0]
-    assert trade["management_stage"] == 1
-    assert trade["stop"] > 100
+    assert trade["management_stage"] == 2
+    assert trade["stop"] == 105
     assert trade["target"] == 120
     assert len(calls) == 1
-    assert calls[0][2] == 120
+    assert calls[0][2] is None
+    app.db.close()
+
+
+def test_structural_trailing_waits_for_ten_percent_roe_beyond_tp2():
+    app, calls = _app(price=120.2, monotonic_lows=True)
+    structural_calls = []
+    app._structural_trailing_stop = (
+        lambda trade, frame, price, atr: structural_calls.append(price) or 110
+    )
+
+    assert app._manage_exchange_trades() is True
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 3
+    assert structural_calls == []
+    assert trade["stop"] == 105
+    assert calls[0][2] is None
+    app.db.close()
+
+
+def test_structural_trailing_starts_after_ten_percent_roe_beyond_tp2():
+    app, calls = _app(price=120.4, monotonic_lows=True)
+    structural_calls = []
+    app._structural_trailing_stop = (
+        lambda trade, frame, price, atr: structural_calls.append(price) or 110
+    )
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert structural_calls == [120.4]
+    assert trade["stop"] == 110
+    assert calls[0][1] == 110
     app.db.close()
 
 

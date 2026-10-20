@@ -334,6 +334,52 @@ class KhtbLab:
         )
         return stop if valid else None
 
+    def _tp1_profit_lock_stop(self, trade, initial_risk, current_price):
+        direction = str(trade.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return None
+
+        entry = float(trade["entry"])
+        current_stop = float(trade["stop"])
+        signed_direction = 1 if direction == "LONG" else -1
+        target_stop = entry + signed_direction * initial_risk
+        if (current_stop - target_stop) * signed_direction >= 0:
+            return None
+
+        try:
+            rounded = Decimal(
+                str(self.execution._precision_price(
+                    trade["symbol"], target_stop
+                ))
+            )
+            unrounded = Decimal(str(target_stop))
+            tick = Decimal(1).scaleb(rounded.as_tuple().exponent)
+            if direction == "LONG" and rounded < unrounded:
+                rounded += tick
+            elif direction == "SHORT" and rounded > unrounded:
+                rounded -= tick
+            stop = float(
+                self.execution._precision_price(
+                    trade["symbol"], float(rounded)
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            log.exception(
+                "Could not apply exchange precision to TP1 profit lock | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            return None
+
+        valid = (
+            current_stop < stop < current_price
+            and stop > entry
+            if direction == "LONG"
+            else current_price < stop < current_stop
+            and stop < entry
+        )
+        return stop if valid else None
+
     def _manage_exchange_trades(self):
         """Advance protection only for positions confirmed by reconciliation."""
         trades = self.db.open_trades(self.settings.trading_env)
@@ -362,6 +408,12 @@ class KhtbLab:
                 if direction not in {"LONG", "SHORT"}:
                     raise ValueError("invalid_position_direction")
                 entry = float(trade["entry"])
+                initial_risk = float(
+                    trade.get("initial_risk")
+                    or abs(entry - float(trade["stop"]))
+                )
+                if not math.isfinite(initial_risk) or initial_risk <= 0:
+                    raise ValueError("invalid_initial_trade_risk")
                 stage = int(trade.get("management_stage") or 0)
                 favorable = self._favorable_price_from_candles(
                     trade,
@@ -385,14 +437,25 @@ class KhtbLab:
                     (float(trade["target"]) - entry)
                     * (1 if direction == "LONG" else -1)
                 )
-                if target_distance <= 0:
-                    raise ValueError("invalid_virtual_tp2")
-
-                stop = float(trade["stop"])
                 entry_leverage = float(
                     trade.get("entry_leverage")
                     or self.settings.leverage
                 )
+                if not math.isfinite(entry_leverage) or entry_leverage <= 0:
+                    raise ValueError("invalid_entry_leverage")
+                post_target_roe_distance = (
+                    entry * self.PROFIT_LOCK_ROE / entry_leverage
+                )
+                tp1_threshold = (
+                    initial_risk + post_target_roe_distance
+                )
+                trailing_threshold = (
+                    target_distance + post_target_roe_distance
+                )
+                if target_distance <= 0:
+                    raise ValueError("invalid_virtual_tp2")
+
+                stop = float(trade["stop"])
                 just_activated = False
                 if stage == 0 and margin_roe >= self.PROFIT_LOCK_ROE:
                     stage = self.PROFIT_LOCK_STAGE
@@ -418,6 +481,13 @@ class KhtbLab:
                     roe_lock_stop = self._margin_roe_profit_lock_stop(
                         trade, price
                     )
+                    tp1_lock_stop = (
+                        self._tp1_profit_lock_stop(
+                            trade, initial_risk, price
+                        )
+                        if favorable_progress >= tp1_threshold
+                        else None
+                    )
                     stop_roe = (
                         (stop - entry)
                         * signed_direction
@@ -427,38 +497,44 @@ class KhtbLab:
                     existing_roe_lock = (
                         stop_roe >= self.PROFIT_LOCK_ROE
                     )
-                    if existing_roe_lock or roe_lock_stop is not None:
+                    structural_trailing_active = (
+                        favorable_progress >= trailing_threshold
+                    )
+                    if structural_trailing_active:
                         structural_stop = self._structural_trailing_stop(
                             trade, frame, price, atr
                         )
-                    candidate_stop = structural_stop
-                    if roe_lock_stop is not None:
+                    candidates = [
+                        stop_candidate
+                        for stop_candidate in (
+                            roe_lock_stop,
+                            tp1_lock_stop,
+                            structural_stop,
+                        )
+                        if stop_candidate is not None
+                    ]
+                    if candidates:
                         if direction == "LONG":
-                            candidate_stop = max(
-                                candidate_stop or stop, roe_lock_stop
-                            )
+                            candidate_stop = max(candidates)
                         else:
-                            candidate_stop = min(
-                                candidate_stop or stop, roe_lock_stop
-                            )
+                            candidate_stop = min(candidates)
+                        if candidate_stop == stop:
+                            candidate_stop = None
 
                 target_near = (
                     favorable_progress >= target_distance * 0.90
                 )
                 stop_now = candidate_stop or stop
-                structural_profit_locked = (
-                    structural_stop is not None
-                    and (
-                        structural_stop > entry
-                        if direction == "LONG"
-                        else structural_stop < entry
-                    )
+                protection_locked = (
+                    stop_now > entry
+                    if direction == "LONG"
+                    else stop_now < entry
                 )
                 remove_target = (
                     stage >= self.PROFIT_LOCK_STAGE
                     and stage < self.TARGET_REMOVED_STAGE
                     and target_near
-                    and structural_profit_locked
+                    and protection_locked
                 )
                 stop_changed = candidate_stop is not None
                 if stop_changed or remove_target:
@@ -551,15 +627,17 @@ class KhtbLab:
                     self.notify(
                         f"🚀 {trade['symbol']} تجاوز TP2 البنيوي الافتراضي "
                         f"عند {trade['target']:.8g}. المركز ما زال كاملًا "
-                        "مفتوحًا والوقف يتبع القيعان/القمم المؤكدة."
+                        "مفتوحًا؛ يبدأ التريلنغ البنيوي بعد امتداد إضافي "
+                        "يعادل 10% ROE على الهامش."
                     )
 
                 if just_activated and candidate_stop is None:
-                    if existing_roe_lock:
+                    if existing_roe_lock and not structural_trailing_active:
                         self.notify(
                             f"ℹ️ {trade['symbol']}: الوقف الحالي يؤمّن بالفعل "
-                            "نحو 10% ROE أو أكثر؛ سيبدأ تحريكه عند تأكيد "
-                            "قمة/قاع بنيوي مناسب."
+                            "نحو 10% ROE أو أكثر. سيُرفع إلى TP1 بعد "
+                            "تجاوزه بمقدار 10% ROE إضافية، ويبدأ التريلنغ "
+                            "البنيوي بعد تجاوز TP2 بالمقدار نفسه."
                         )
                     else:
                         self.notify(
