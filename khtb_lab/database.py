@@ -11,7 +11,7 @@ class Database:
     def _init(self):
         self.conn.executescript("""CREATE TABLE IF NOT EXISTS symbols(symbol TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,added_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,symbol TEXT NOT NULL,direction TEXT NOT NULL,price REAL,score REAL,setup TEXT,reason TEXT,snapshot TEXT);
-        CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT,ts_open TEXT NOT NULL,ts_close TEXT,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL NOT NULL,stop REAL NOT NULL,target REAL NOT NULL,qty REAL NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL,pnl REAL,r_multiple REAL,source TEXT NOT NULL DEFAULT 'PAPER',close_reason TEXT,snapshot TEXT,initial_risk REAL NOT NULL DEFAULT 0,management_stage INTEGER NOT NULL DEFAULT 0,favorable_price REAL,protection_order_id TEXT,protection_client_oid TEXT);
+        CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT,ts_open TEXT NOT NULL,ts_close TEXT,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL NOT NULL,stop REAL NOT NULL,target REAL NOT NULL,qty REAL NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL,pnl REAL,r_multiple REAL,source TEXT NOT NULL DEFAULT 'PAPER',close_reason TEXT,snapshot TEXT,initial_risk REAL NOT NULL DEFAULT 0,management_stage INTEGER NOT NULL DEFAULT 0,favorable_price REAL,entry_leverage REAL,protection_order_id TEXT,protection_client_oid TEXT);
         CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS daily_stats(day TEXT PRIMARY KEY,realized_pnl REAL NOT NULL DEFAULT 0,trades INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS trade_followups(
@@ -32,6 +32,7 @@ class Database:
             "initial_risk": "ALTER TABLE trades ADD COLUMN initial_risk REAL NOT NULL DEFAULT 0",
             "management_stage": "ALTER TABLE trades ADD COLUMN management_stage INTEGER NOT NULL DEFAULT 0",
             "favorable_price": "ALTER TABLE trades ADD COLUMN favorable_price REAL",
+            "entry_leverage": "ALTER TABLE trades ADD COLUMN entry_leverage REAL",
             "protection_order_id": "ALTER TABLE trades ADD COLUMN protection_order_id TEXT",
             "protection_client_oid": "ALTER TABLE trades ADD COLUMN protection_client_oid TEXT",
         }
@@ -73,13 +74,14 @@ class Database:
         snapshot=None,
         protection_order_id=None,
         protection_client_oid=None,
+        entry_leverage=None,
     ):
         cur = self.conn.execute(
             "INSERT INTO trades("
             "ts_open,symbol,direction,entry,stop,target,qty,status,mode,"
-            "source,snapshot,initial_risk,favorable_price,"
+            "source,snapshot,initial_risk,favorable_price,entry_leverage,"
             "protection_order_id,protection_client_oid"
-            ") VALUES(?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?)",
+            ") VALUES(?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?,?,?)",
             (
                 datetime.now(timezone.utc).isoformat(),
                 symbol,
@@ -93,6 +95,7 @@ class Database:
                 json.dumps(snapshot or {}, default=str),
                 abs(float(entry) - float(stop)),
                 float(entry),
+                entry_leverage,
                 protection_order_id,
                 protection_client_oid,
             ),

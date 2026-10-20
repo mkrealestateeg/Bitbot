@@ -25,20 +25,27 @@ def _candles(monotonic_lows=False):
     })
 
 
-def _app(price, target=120, monotonic_lows=False):
+def _app(
+    price,
+    target=120,
+    monotonic_lows=False,
+    direction="LONG",
+    leverage=30,
+):
     app = KhtbLab.__new__(KhtbLab)
     app.db = Database(":memory:")
     trade_id = app.db.open_trade(
         "BTC/USDT",
-        "LONG",
+        direction,
         100,
-        95,
+        95 if direction == "LONG" else 105,
         target,
         2,
         source="DEMO",
         snapshot={"atr": 2},
         protection_order_id="tpsl-1",
         protection_client_oid="tpsl-client",
+        entry_leverage=leverage,
     )
     app.db.conn.execute(
         "UPDATE trades SET ts_open=? WHERE id=?",
@@ -65,16 +72,17 @@ def _app(price, target=120, monotonic_lows=False):
     app.settings = SimpleNamespace(
         trading_env="DEMO",
         timeframe_main="15m",
+        leverage=leverage,
     )
     app.current_price = lambda symbol: price
     app.notify = lambda message: None
     return app, calls
 
 
-def test_profit_lock_stays_inactive_before_one_r_of_initial_risk():
-    app, calls = _app(price=104)
+def test_profit_lock_stays_inactive_before_ten_percent_margin_roe():
+    app, calls = _app(price=100.32, monotonic_lows=True)
     frame = _candles(monotonic_lows=True)
-    frame["high"] = frame["high"].clip(upper=104.99)
+    frame["high"] = frame["high"].clip(upper=100.32)
     app.market.candles = lambda symbol, timeframe, limit: frame
 
     assert app._manage_exchange_trades() is True
@@ -86,54 +94,85 @@ def test_profit_lock_stays_inactive_before_one_r_of_initial_risk():
     app.db.close()
 
 
-def test_profit_lock_activates_at_one_r_without_using_leverage_or_margin():
-    app, calls = _app(price=105, monotonic_lows=True)
+def test_profit_lock_secures_ten_percent_margin_roe_before_structure_forms():
+    app, calls = _app(price=100.34, monotonic_lows=True)
     frame = _candles(monotonic_lows=True)
-    frame["high"] = frame["high"].clip(upper=105)
+    frame["high"] = frame["high"].clip(upper=100.34)
     app.market.candles = lambda symbol, timeframe, limit: frame
-    app.settings.leverage = 30
 
     assert app._manage_exchange_trades() is True
 
     trade = app.db.open_trades("DEMO")[0]
     assert trade["management_stage"] == 1
-    assert trade["favorable_price"] == 105
-    assert trade["stop"] == 95
-    assert calls == []
+    assert trade["favorable_price"] == 100.34
+    assert 100.33 <= trade["stop"] < 100.34
+    assert len(calls) == 1
+    assert calls[0][1] == trade["stop"]
+    assert calls[0][2] == 120
     app.db.close()
 
 
-def test_profit_lock_uses_saved_initial_risk_not_a_manually_changed_stop():
-    app, calls = _app(price=104, monotonic_lows=True)
+def test_profit_lock_uses_entry_leverage_and_does_not_loosen_safer_stop():
+    app, calls = _app(
+        price=100.6,
+        monotonic_lows=True,
+        leverage=20,
+    )
     app.db.conn.execute(
-        "UPDATE trades SET stop=103 WHERE status='OPEN'"
+        "UPDATE trades SET stop=100.55 WHERE status='OPEN'"
     )
     app.db.conn.commit()
     frame = _candles(monotonic_lows=True)
-    frame["high"] = frame["high"].clip(upper=104.99)
+    frame["high"] = frame["high"].clip(upper=100.6)
     app.market.candles = lambda symbol, timeframe, limit: frame
 
     assert app._manage_exchange_trades() is True
 
     trade = app.db.open_trades("DEMO")[0]
-    assert trade["initial_risk"] == 5
-    assert trade["management_stage"] == 0
-    assert trade["stop"] == 103
+    assert trade["entry_leverage"] == 20
+    assert trade["management_stage"] == 1
+    assert trade["stop"] == 100.55
     assert calls == []
     app.db.close()
 
 
-def test_intrabar_favorable_high_triggers_profit_lock_after_retracement():
-    app, calls = _app(price=100, monotonic_lows=True)
+def test_short_profit_lock_sets_stop_for_ten_percent_margin_roe():
+    app, calls = _app(
+        price=99.66,
+        target=80,
+        monotonic_lows=True,
+        direction="SHORT",
+    )
     frame = _candles(monotonic_lows=True)
-    frame.loc[5, "high"] = 113
+    lows = [100.8 - index * 0.1 for index in range(13)]
+    frame["low"] = lows
+    frame["open"] = [low + 0.5 for low in lows]
+    frame["high"] = [low + 2 for low in lows]
+    frame["close"] = [low + 1 for low in lows]
     app.market.candles = lambda symbol, timeframe, limit: frame
 
     assert app._manage_exchange_trades() is True
 
     trade = app.db.open_trades("DEMO")[0]
     assert trade["management_stage"] == 1
-    assert trade["favorable_price"] == 113
+    assert 99.66 < trade["stop"] <= 99.67
+    assert len(calls) == 1
+    assert calls[0][1] == trade["stop"]
+    app.db.close()
+
+
+def test_profit_lock_trigger_reached_but_market_has_crossed_lock_price():
+    app, calls = _app(price=100.2, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=100.5).astype(float)
+    frame.loc[5, "high"] = 100.5
+    app.market.candles = lambda symbol, timeframe, limit: frame
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["favorable_price"] == 100.5
     assert trade["stop"] == 95
     assert calls == []
     app.db.close()
@@ -194,9 +233,10 @@ def test_tp2_remains_active_until_a_profitable_confirmed_swing_exists():
 
     trade = app.db.open_trades("DEMO")[0]
     assert trade["management_stage"] == 1
-    assert trade["stop"] == 95
+    assert trade["stop"] > 100
     assert trade["target"] == 120
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][2] == 120
     app.db.close()
 
 

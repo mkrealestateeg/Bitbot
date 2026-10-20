@@ -27,6 +27,7 @@ class KhtbLab:
     PROFIT_LOCK_STAGE = 1
     TARGET_REMOVED_STAGE = 2
     TARGET_CROSSED_STAGE = 3
+    PROFIT_LOCK_ROE = 0.10
 
     def __init__(self, settings):
         settings.validate()
@@ -270,6 +271,69 @@ class KhtbLab:
             return None
         return max(candidates, key=lambda item: item[0])[1]
 
+    def _margin_roe_profit_lock_stop(self, trade, current_price):
+        direction = str(trade.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return None
+
+        entry = float(trade["entry"])
+        current_stop = float(trade["stop"])
+        leverage = float(
+            trade.get("entry_leverage") or self.settings.leverage
+        )
+        if (
+            not math.isfinite(entry)
+            or not math.isfinite(current_stop)
+            or not math.isfinite(leverage)
+            or entry <= 0
+            or leverage <= 0
+        ):
+            raise ValueError("invalid_profit_lock_inputs")
+
+        movement = entry * self.PROFIT_LOCK_ROE / leverage
+        target_stop = (
+            entry + movement
+            if direction == "LONG"
+            else entry - movement
+        )
+        signed_direction = 1 if direction == "LONG" else -1
+        if (current_stop - target_stop) * signed_direction >= 0:
+            return None
+
+        try:
+            rounded = Decimal(
+                str(self.execution._precision_price(
+                    trade["symbol"], target_stop
+                ))
+            )
+            unrounded = Decimal(str(target_stop))
+            tick = Decimal(1).scaleb(rounded.as_tuple().exponent)
+            if direction == "LONG" and rounded < unrounded:
+                rounded += tick
+            elif direction == "SHORT" and rounded > unrounded:
+                rounded -= tick
+            stop = float(
+                self.execution._precision_price(
+                    trade["symbol"], float(rounded)
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            log.exception(
+                "Could not apply exchange precision to margin-ROE lock | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            return None
+
+        valid = (
+            current_stop < stop < current_price
+            and stop > entry
+            if direction == "LONG"
+            else current_price < stop < current_stop
+            and stop < entry
+        )
+        return stop if valid else None
+
     def _manage_exchange_trades(self):
         """Advance protection only for positions confirmed by reconciliation."""
         trades = self.db.open_trades(self.settings.trading_env)
@@ -298,13 +362,6 @@ class KhtbLab:
                 if direction not in {"LONG", "SHORT"}:
                     raise ValueError("invalid_position_direction")
                 entry = float(trade["entry"])
-                initial_risk = float(
-                    trade.get("initial_risk")
-                    or abs(entry - float(trade["stop"]))
-                )
-                if not math.isfinite(initial_risk) or initial_risk <= 0:
-                    raise ValueError("invalid_initial_trade_risk")
-
                 stage = int(trade.get("management_stage") or 0)
                 favorable = self._favorable_price_from_candles(
                     trade,
@@ -316,7 +373,14 @@ class KhtbLab:
                 favorable_progress = (
                     (favorable - entry) * signed_direction
                 )
-                risk_multiple = favorable_progress / initial_risk
+                margin_roe = (
+                    favorable_progress
+                    / entry
+                    * float(
+                        trade.get("entry_leverage")
+                        or self.settings.leverage
+                    )
+                )
                 target_distance = (
                     (float(trade["target"]) - entry)
                     * (1 if direction == "LONG" else -1)
@@ -325,43 +389,76 @@ class KhtbLab:
                     raise ValueError("invalid_virtual_tp2")
 
                 stop = float(trade["stop"])
+                entry_leverage = float(
+                    trade.get("entry_leverage")
+                    or self.settings.leverage
+                )
                 just_activated = False
-                if stage == 0 and risk_multiple >= 1.0:
+                if stage == 0 and margin_roe >= self.PROFIT_LOCK_ROE:
                     stage = self.PROFIT_LOCK_STAGE
                     just_activated = True
                     log.info(
-                        "STRUCTURAL TRAILING ACTIVATED | trade_id=%s | "
-                        "symbol=%s | favorable_r=%.4f",
+                        "MARGIN ROE PROFIT LOCK ACTIVATED | trade_id=%s | "
+                        "symbol=%s | favorable_roe=%.4f | leverage=%s",
                         trade["id"],
                         trade["symbol"],
-                        risk_multiple,
+                        margin_roe,
+                        entry_leverage,
                     )
                     self.notify(
                         f"🛡 {trade['symbol']} وصل إلى "
-                        f"{risk_multiple:.2f}R من المخاطرة الأصلية؛ بدأ تتبع "
-                        "الوقف خلف القمم/القيعان المؤكدة."
+                        f"{margin_roe:.1%} ROE إجمالي تقريبي؛ يجري تثبيت "
+                        f"نحو {self.PROFIT_LOCK_ROE:.0%} ROE في وقف الحماية، "
+                        "ثم يتابع الوقف القمم/القيعان المؤكدة."
                     )
 
                 candidate_stop = None
+                structural_stop = None
                 if stage >= self.PROFIT_LOCK_STAGE:
-                    candidate_stop = self._structural_trailing_stop(
-                        trade, frame, price, atr
+                    roe_lock_stop = self._margin_roe_profit_lock_stop(
+                        trade, price
                     )
+                    stop_roe = (
+                        (stop - entry)
+                        * signed_direction
+                        / entry
+                        * entry_leverage
+                    )
+                    existing_roe_lock = (
+                        stop_roe >= self.PROFIT_LOCK_ROE
+                    )
+                    if existing_roe_lock or roe_lock_stop is not None:
+                        structural_stop = self._structural_trailing_stop(
+                            trade, frame, price, atr
+                        )
+                    candidate_stop = structural_stop
+                    if roe_lock_stop is not None:
+                        if direction == "LONG":
+                            candidate_stop = max(
+                                candidate_stop or stop, roe_lock_stop
+                            )
+                        else:
+                            candidate_stop = min(
+                                candidate_stop or stop, roe_lock_stop
+                            )
 
                 target_near = (
                     favorable_progress >= target_distance * 0.90
                 )
                 stop_now = candidate_stop or stop
-                locked_profit = (
-                    stop_now > entry
-                    if direction == "LONG"
-                    else stop_now < entry
+                structural_profit_locked = (
+                    structural_stop is not None
+                    and (
+                        structural_stop > entry
+                        if direction == "LONG"
+                        else structural_stop < entry
+                    )
                 )
                 remove_target = (
                     stage >= self.PROFIT_LOCK_STAGE
                     and stage < self.TARGET_REMOVED_STAGE
                     and target_near
-                    and locked_profit
+                    and structural_profit_locked
                 )
                 stop_changed = candidate_stop is not None
                 if stop_changed or remove_target:
@@ -458,11 +555,18 @@ class KhtbLab:
                     )
 
                 if just_activated and candidate_stop is None:
-                    self.notify(
-                        f"ℹ️ {trade['symbol']}: لم يتكوّن بعد ارتداد "
-                        "بنيوي مؤكد يتيح رفع الوقف بأمان؛ وقف Bitget الحالي "
-                        "لم يتغير."
-                    )
+                    if existing_roe_lock:
+                        self.notify(
+                            f"ℹ️ {trade['symbol']}: الوقف الحالي يؤمّن بالفعل "
+                            "نحو 10% ROE أو أكثر؛ سيبدأ تحريكه عند تأكيد "
+                            "قمة/قاع بنيوي مناسب."
+                        )
+                    else:
+                        self.notify(
+                            f"ℹ️ {trade['symbol']}: السعر الحالي عاد إلى مستوى "
+                            "وقف تأمين الربح أو دونه؛ تعذر تثبيت العائد الآن. "
+                            "سيُعاد تقييم الوقف في دورة المسح التالية."
+                        )
 
                 if not self.db.save_trade_management(
                     trade["id"],
@@ -736,6 +840,7 @@ class KhtbLab:
             protection_client_oid=(result.get("protection") or {}).get(
                 "client_oid"
             ),
+            entry_leverage=self.settings.leverage,
         )
 
         log.info(
