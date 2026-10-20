@@ -2,6 +2,7 @@ from __future__ import annotations
 import json,math,sqlite3
 from pathlib import Path
 from datetime import datetime,timezone,date
+from .local_learning import FEATURE_NAMES,MODEL_VERSION
 class Database:
     def __init__(self,path):
         self.path=path
@@ -187,6 +188,54 @@ class Database:
         risk=abs(row["entry"]-row["stop"]);move=(exit_price-row["entry"])*(1 if row["direction"]=="LONG" else -1);r=move/risk if risk else 0.0;now=datetime.now(timezone.utc)
         self.conn.execute("UPDATE trades SET ts_close=?,status='CLOSED',pnl=?,r_multiple=?,close_reason=? WHERE id=?",(now.isoformat(),pnl,r,reason,trade_id))
         day=now.date().isoformat();self.conn.execute("INSERT INTO daily_stats(day,realized_pnl,trades) VALUES(?,?,1) ON CONFLICT(day) DO UPDATE SET realized_pnl=realized_pnl+excluded.realized_pnl,trades=trades+1",(day,pnl));self.conn.commit();return True
+    def set_value(self,key,value):
+        self.conn.execute(
+            "INSERT INTO kv(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key),str(value)),
+        )
+        self.conn.commit()
+    def get_value(self,key):
+        row=self.conn.execute("SELECT value FROM kv WHERE key=?",(str(key),)).fetchone()
+        return row["value"] if row else None
+    def local_learning_examples(self,source):
+        rows=self.conn.execute(
+            "SELECT id,pnl,snapshot FROM trades "
+            "WHERE status='CLOSED' AND source=? AND pnl IS NOT NULL AND pnl!=0 "
+            "ORDER BY ts_close,id",
+            (str(source).upper(),),
+        ).fetchall()
+        examples=[]
+        for row in rows:
+            try:
+                snapshot=json.loads(row["snapshot"] or "{}")
+            except (TypeError,ValueError):
+                continue
+            learning=snapshot.get("local_learning")
+            if not isinstance(learning,dict):
+                continue
+            if learning.get("schema_version")!=MODEL_VERSION:
+                continue
+            if learning.get("feature_names")!=list(FEATURE_NAMES):
+                continue
+            features=learning.get("features")
+            if (
+                not isinstance(features,list)
+                or len(features)!=len(FEATURE_NAMES)
+                or not math.isfinite(float(row["pnl"]))
+                or any(
+                    not isinstance(value,(int,float))
+                    or not math.isfinite(float(value))
+                    for value in features
+                )
+            ):
+                continue
+            examples.append({
+                "id":int(row["id"]),
+                "pnl":float(row["pnl"]),
+                "learning":learning,
+            })
+        return examples
     def recent_trades(self,limit=10):return[dict(r) for r in self.conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?",(limit,))]
     def daily_pnl(self):
         row=self.conn.execute("SELECT realized_pnl FROM daily_stats WHERE day=?",(date.today().isoformat(),)).fetchone();return float(row[0]) if row else 0.0

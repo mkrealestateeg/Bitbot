@@ -1,9 +1,10 @@
 from .risk import position_size
+from .local_learning import capture_entry_snapshot
 class PaperBroker:
     def __init__(self,settings,db):self.settings=settings;self.db=db;self.capital=settings.starting_capital;self.risk_fraction=settings.risk_per_trade
     def open(self,symbol,signal,mode="AUTO"):
         qty=position_size(self.capital,signal["price"],signal["stop"],self.risk_fraction)
-        return self.db.open_trade(symbol,signal["direction"],signal["price"],signal["stop"],signal["target"],qty,mode=mode,source="PAPER",snapshot=signal.get("snapshot")) if qty>0 else None
+        return self.db.open_trade(symbol,signal["direction"],signal["price"],signal["stop"],signal["target"],qty,mode=mode,source="PAPER",snapshot=capture_entry_snapshot(signal,"PAPER")) if qty>0 else None
     def mark(self,prices):
         closed=[]
         for trade in self.db.open_trades("PAPER"):
