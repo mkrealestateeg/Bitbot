@@ -67,6 +67,9 @@ def test_scan_once_processes_enabled_symbols_and_updates_status():
     app.telegram = None
     app.last_scan = "Never"
     app.last_result = "Not scanned"
+    app.local_learner = SimpleNamespace(
+        refresh=lambda source: {"status": "WARMING", "samples": 0}
+    )
     app.execution = SimpleNamespace(
         reconcile_positions=lambda trades: {"ok": True, "live_positions": 0}
     )
@@ -96,6 +99,9 @@ def test_scan_once_blocks_auto_entries_when_exchange_state_is_unreconciled():
     app.telegram = None
     app.last_scan = "Never"
     app.last_result = "Not scanned"
+    app.local_learner = SimpleNamespace(
+        refresh=lambda source: {"status": "WARMING", "samples": 0}
+    )
     app.execution = SimpleNamespace(
         reconcile_positions=lambda trades: {
             "ok": False,
@@ -227,11 +233,25 @@ def test_take_reaches_demo_execution_only_when_demo_gates_pass(
     app.mode = "AUTO"
     app.profile = "SAFE"
     app.notify = lambda message: None
-    app._review_ai = lambda symbol, candidate: {
-        "decision": "TAKE",
-        "status": "OK",
-        "confidence": 90,
-    }
+    reviewed_signals = []
+    app.local_learner = SimpleNamespace(
+        predict=lambda source, candidate: {
+            "win_probability": 0.7,
+            "samples": 40,
+            "source": source,
+            "advisory_only": True,
+        }
+    )
+
+    def review_ai(symbol, candidate):
+        reviewed_signals.append(candidate)
+        return {
+            "decision": "TAKE",
+            "status": "OK",
+            "confidence": 90,
+        }
+
+    app._review_ai = review_ai
 
     engine = ExecutionEngine.__new__(ExecutionEngine)
     engine.settings = settings
@@ -266,6 +286,10 @@ def test_take_reaches_demo_execution_only_when_demo_gates_pass(
 
     app._process_symbol(symbol, {}, allow_auto=True)
 
+    assert all(
+        "local_learning_prediction" not in candidate
+        for candidate in reviewed_signals
+    )
     assert bool(engine.execute_calls) is expect_execute
     if expect_execute:
         assert gate_calls

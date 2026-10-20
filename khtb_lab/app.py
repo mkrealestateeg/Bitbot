@@ -18,6 +18,7 @@ from .paper import PaperBroker
 from .execution import ExecutionEngine
 from .ai_review import AIReviewer
 from .backtest import run_backtest
+from .local_learning import LocalTradeLearner, capture_entry_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class KhtbLab:
         self.paper = PaperBroker(settings, self.db)
         self.execution = ExecutionEngine(settings)
         self.ai = AIReviewer(settings)
+        self.local_learner = LocalTradeLearner(self.db)
 
         self.last_scan = "Never"
         self.last_result = "Not scanned"
@@ -640,6 +642,15 @@ class KhtbLab:
         confidence = ai.get("confidence", 0)
         comment = ai.get("comment", "")
         ai_status = ai.get("status", "UNKNOWN")
+        local = signal.get("local_learning_prediction")
+        local_text = (
+            f"Unvalidated local estimate: "
+            f"{local['win_probability']:.0%} "
+            f"({local['samples']} closed trades; advisory only, "
+            f"not calibrated)\n"
+            if isinstance(local, dict)
+            else "Local model: gathering completed trade data\n"
+        )
 
         return (
             f"🟡 OPPORTUNITY READY\n"
@@ -652,6 +663,7 @@ class KhtbLab:
             f"Entry: {signal['price']:.8g}\n"
             f"SL: {signal['stop']:.8g}\n"
             f"TP: {signal['target']:.8g}\n"
+            f"{local_text}"
             f"{comment}"
         )
 
@@ -700,6 +712,12 @@ class KhtbLab:
                 "average price and filled quantity"
             )
 
+        learning_signal = {
+            **signal,
+            "price": average,
+            "stop": result.get("stop", signal["stop"]),
+            "target": result.get("target", signal["target"]),
+        }
         trade_id = self.db.open_trade(
             symbol,
             direction,
@@ -709,7 +727,9 @@ class KhtbLab:
             filled_quantity,
             mode="AUTO",
             source=self.settings.trading_env,
-            snapshot=signal.get("snapshot"),
+            snapshot=capture_entry_snapshot(
+                learning_signal, self.settings.trading_env
+            ),
             protection_order_id=(result.get("protection") or {}).get(
                 "order_id"
             ),
@@ -952,6 +972,10 @@ class KhtbLab:
             )
             return
 
+        local_prediction = self.local_learner.predict(
+            self.settings.trading_env, signal
+        )
+
         log.info(
             "OPPORTUNITY QUALIFIED | symbol=%s | direction=%s | score=%.1f",
             symbol,
@@ -974,7 +998,14 @@ class KhtbLab:
         ai = self._review_ai(symbol, signal)
 
         if self.settings.notify_technical_opportunity:
-            self.notify(self.opportunity_text(symbol, signal, ai))
+            opportunity_signal = dict(signal)
+            if local_prediction:
+                opportunity_signal["local_learning_prediction"] = (
+                    local_prediction
+                )
+            self.notify(
+                self.opportunity_text(symbol, opportunity_signal, ai)
+            )
 
         decision = str(ai.get("decision", "NOT_REVIEWED")).upper()
         ai_status = str(ai.get("status", "UNKNOWN")).upper()
@@ -1206,6 +1237,12 @@ class KhtbLab:
         prices = {}
         errors = 0
 
+        try:
+            self.local_learner.refresh(self.settings.trading_env)
+        except Exception:
+            errors += 1
+            log.exception("LOCAL TRADE MODEL REFRESH FAILED")
+
         if self.settings.trading_env != "PAPER":
             reconciliation = self.execution.reconcile_positions(
                 self.db.open_trades(self.settings.trading_env)
@@ -1305,6 +1342,21 @@ class KhtbLab:
         if self.telegram:
             self.telegram.sync_open_trade_statuses()
 
+        try:
+            learning_state = self.local_learner.refresh(
+                self.settings.trading_env
+            )
+            log.info(
+                "LOCAL TRADE MODEL STATUS | source=%s | status=%s | "
+                "samples=%s",
+                self.settings.trading_env,
+                learning_state.get("status"),
+                learning_state.get("samples"),
+            )
+        except Exception:
+            errors += 1
+            log.exception("LOCAL TRADE MODEL REFRESH FAILED")
+
         self.last_scan = time.strftime("%Y-%m-%d %H:%M:%S")
         self.last_result = (
             f"Completed scan; symbols={len(symbols)}; errors={errors}"
@@ -1319,6 +1371,9 @@ class KhtbLab:
         return self.last_result
 
     def status_text(self):
+        learning_status = self.local_learner.status(
+            self.settings.trading_env
+        )
         if self.settings.trading_env == "PAPER":
             equity = self.paper.capital
             available = self.paper.capital
@@ -1361,6 +1416,9 @@ class KhtbLab:
             f"Symbols: {len(self.db.enabled_symbols())}\n"
             f"Open Trades: "
             f"{len(self.db.open_trades(self.settings.trading_env))}\n"
+            f"Local Learning: "
+            f"{learning_status.get('status')} "
+            f"({learning_status.get('samples', 0)} samples)\n"
             f"Equity: {equity if equity is not None else 0:.2f} USDT\n"
             f"Available: {available if available is not None else 0:.2f} USDT\n"
             f"Daily PnL: {self.db.daily_pnl():.4f}\n"
