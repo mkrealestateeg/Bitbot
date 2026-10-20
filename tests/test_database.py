@@ -114,5 +114,6 @@ def test_existing_trade_database_is_migrated_with_safe_management_defaults(
     assert trade['initial_risk']==5
     assert trade['management_stage']==0
     assert trade['favorable_price']==100
+    assert trade['entry_leverage'] is None
     assert trade['protection_order_id'] is None
     db.close()
