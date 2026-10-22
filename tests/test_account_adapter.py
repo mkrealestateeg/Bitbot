@@ -70,6 +70,25 @@ def test_tpsl_strategy_order_is_separate_and_reduce_only_in_one_way_mode():
     assert "posSide" not in body
 
 
+def test_tpsl_strategy_order_can_restore_stop_without_take_profit():
+    adapter, requests = _adapter()
+
+    adapter.place_tpsl_order(
+        "BTC/USDT:USDT",
+        side="buy",
+        client_oid="tpsl-stop-only",
+        stop="105",
+        target=None,
+        pos_side="short",
+    )
+
+    body = requests[0][3]
+    assert body["stopLoss"] == "105"
+    assert body["takeProfit"] == ""
+    assert body["tpTriggerBy"] == ""
+    assert body["tpOrderType"] == ""
+
+
 def test_tpsl_strategy_order_identifies_hedge_position_side():
     adapter, requests = _adapter(position_mode="hedge")
 

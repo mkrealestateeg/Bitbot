@@ -61,6 +61,8 @@ class _ExecutionAccount:
         self.tpsl_order = None
         self.positions = []
         self.ignore_empty_tp = False
+        self.modify_error = None
+        self.remove_order_on_modify_error = False
 
     def set_leverage(self, symbol, leverage):
         self.calls.append("leverage")
@@ -98,10 +100,49 @@ class _ExecutionAccount:
         self, symbol, order_id, client_oid, quantity, stop, target, pos_side
     ):
         self.calls.append(("modify-tpsl", stop, target))
+        if self.modify_error:
+            if self.remove_order_on_modify_error:
+                self.tpsl_order = None
+            raise self.modify_error
         self.tpsl_order["stopLoss"] = stop
         if target is not None or not self.ignore_empty_tp:
             self.tpsl_order["takeProfit"] = target
         return {"orderId": order_id, "clientOid": client_oid}
+
+    def place_tpsl_order(
+        self, symbol, side, client_oid, stop, target, pos_side
+    ):
+        self.calls.append((
+            "restore-tpsl" if target is None else "tpsl",
+            stop,
+            target,
+        ))
+        self.tpsl_order = {
+            "symbol": symbol.replace("/", ""),
+            "orderId": "tpsl-restored",
+            "clientOid": client_oid,
+            "status": "live",
+            "stopLoss": stop,
+            "takeProfit": target,
+        }
+        return {
+            "orderId": "tpsl-restored",
+            "clientOid": client_oid,
+        }
+
+
+class _ProtectionPriceExchange:
+    def __init__(self, marks):
+        self.marks = iter(marks)
+
+    def fetch_ticker(self, symbol):
+        return {"mark": next(self.marks)}
+
+    def price_to_precision(self, symbol, price):
+        return str(Decimal(str(price)).quantize(Decimal("0.01")))
+
+    def amount_to_precision(self, symbol, quantity):
+        return str(quantity)
 
 
 def _executable_engine(reject_entry=False):
@@ -486,6 +527,97 @@ def test_tpsl_update_fails_closed_if_exchange_does_not_remove_tp():
     assert engine.account.tpsl_order["stopLoss"] == 105
     assert engine.account.tpsl_order["takeProfit"] == "110"
     assert engine.positions_reconciled is False
+
+
+def _short_protection_update_engine(mark_prices):
+    engine = _ready_demo_engine()
+    calls = []
+    engine.account = _ExecutionAccount(calls)
+    engine.account.positions = [{
+        "symbol": "BTCUSDT",
+        "holdSide": "short",
+        "total": "0.5",
+    }]
+    engine.account.tpsl_order = {
+        "symbol": "BTCUSDT",
+        "orderId": "tpsl-1",
+        "clientOid": "tracked-tpsl",
+        "status": "live",
+        "stopLoss": "105",
+        "takeProfit": "90",
+    }
+    engine.exchange = _ProtectionPriceExchange(mark_prices)
+    trade = {
+        "id": 7,
+        "symbol": "BTC/USDT",
+        "direction": "SHORT",
+        "qty": 0.5,
+        "entry": 100,
+        "stop": 105,
+        "target": 90,
+        "management_stage": 1,
+        "protection_order_id": "tpsl-1",
+        "protection_client_oid": "tracked-tpsl",
+    }
+    return engine, calls, trade
+
+
+def test_short_tpsl_update_is_skipped_when_new_stop_is_at_or_below_mark():
+    engine, calls, trade = _short_protection_update_engine(["99.67"])
+
+    result = engine.update_tpsl_protection(trade, 99.66, 90)
+
+    assert result["ok"] is False
+    assert result["protection_preserved"] is True
+    assert float(result["actual_stop"]) == 105
+    assert float(engine.account.tpsl_order["stopLoss"]) == 105
+    assert engine.positions_reconciled is True
+    assert calls == []
+
+
+def test_short_mark_price_race_keeps_old_confirmed_stop_after_rejection():
+    engine, calls, trade = _short_protection_update_engine(
+        ["99.65", "99.67"]
+    )
+    engine.account.modify_error = RuntimeError(
+        "Bitget HTTP 400: 25592 stop-loss trigger price must be greater "
+        "than the mark price"
+    )
+
+    result = engine.update_tpsl_protection(trade, 99.66, 90)
+
+    assert result["ok"] is False
+    assert result["protection_preserved"] is True
+    assert result["actual_stop"] == "105"
+    assert engine.account.tpsl_order["stopLoss"] == "105"
+    assert engine.positions_reconciled is True
+    assert calls == [("modify-tpsl", 99.66, 90)]
+
+
+def test_missing_old_protection_is_replaced_with_confirmed_stop_only_order():
+    engine, calls, trade = _short_protection_update_engine(
+        ["99.65", "99.65"]
+    )
+    engine.account.modify_error = RuntimeError(
+        "Bitget HTTP 400: 25592 stop-loss trigger price must be greater "
+        "than the mark price"
+    )
+    engine.account.remove_order_on_modify_error = True
+
+    result = engine.update_tpsl_protection(trade, 99.66, 90)
+
+    assert result["ok"] is False
+    assert result["protection_preserved"] is True
+    assert result["protection_restored"] is True
+    assert float(result["actual_stop"]) == 105
+    assert result["actual_target"] is None
+    assert float(engine.account.tpsl_order["stopLoss"]) == 105
+    assert engine.account.tpsl_order["takeProfit"] is None
+    assert engine.positions_reconciled is True
+    assert calls == [
+        ("modify-tpsl", 99.66, 90),
+        ("restore-tpsl", "105.00", None),
+    ]
 
 
 def test_failed_position_reconciliation_resets_execution_gate():

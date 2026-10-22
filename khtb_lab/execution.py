@@ -618,6 +618,264 @@ class ExecutionEngine:
             return stop < entry
         return False
 
+    def _mark_price(self, symbol):
+        if self.exchange is None:
+            return None
+        ticker = self.exchange.fetch_ticker(symbol)
+        info = ticker.get("info") if isinstance(ticker, dict) else None
+        mark = (
+            self._number_or_none(ticker.get("mark"))
+            if isinstance(ticker, dict)
+            else None
+        )
+        if mark is None and isinstance(info, dict):
+            mark = self._number_or_none(info.get("markPrice"))
+        return mark
+
+    def _active_trade_strategy_orders(self, symbol, direction, orders):
+        normalized_symbol = self._normalized_symbol(symbol)
+        hedge_mode = (
+            str(
+                getattr(self.settings, "position_mode", "one_way")
+            ).lower()
+            == "hedge"
+        )
+        matches = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if self._normalized_symbol(order.get("symbol")) != normalized_symbol:
+                continue
+            if str(order.get("status") or "").lower() not in (
+                self.ACTIVE_STRATEGY_STATUSES
+            ):
+                continue
+            if hedge_mode and str(
+                order.get("posSide") or order.get("holdSide") or ""
+            ).lower() != direction.lower():
+                continue
+            matches.append(order)
+        return matches
+
+    def _strategy_order_matches(self, order, stop, target, quantity):
+        if not self._same_decimal(order.get("stopLoss"), stop):
+            return False
+        actual_target = self._number_or_none(order.get("takeProfit"))
+        if target is None:
+            if actual_target is not None:
+                return False
+        elif not self._same_decimal(actual_target, target):
+            return False
+        actual_quantity = self._number_or_none(
+            order.get("qty") or order.get("size")
+        )
+        return (
+            actual_quantity is None
+            or abs(actual_quantity - quantity)
+            <= max(quantity * 1e-6, 1e-8)
+        )
+
+    def _preserve_protection_after_update_failure(
+        self,
+        trade,
+        order_id,
+        client_oid,
+        requested_stop,
+        requested_target,
+        old_stop,
+        old_target,
+        failure_reason,
+    ):
+        symbol = trade["symbol"]
+        direction = str(trade["direction"]).upper()
+        quantity = self._as_float(trade.get("qty"))
+        try:
+            positions = self.account.current_positions(symbol)
+            if not isinstance(positions, list):
+                raise ValueError("position_response_invalid")
+            matching_positions = [
+                position
+                for position in (
+                    self._exchange_position(raw) for raw in positions
+                )
+                if position is not None
+                and position["symbol"] == self._normalized_symbol(symbol)
+                and position["direction"] == direction
+            ]
+            if len(matching_positions) != 1 or quantity <= 0:
+                raise ValueError("position_not_unique_after_tpsl_failure")
+            actual_quantity = matching_positions[0]["quantity"]
+            if abs(actual_quantity - quantity) > max(
+                quantity * 1e-6, 1e-8
+            ):
+                raise ValueError("position_quantity_changed_after_tpsl_failure")
+        except Exception as exc:
+            self.positions_reconciled = False
+            log.exception(
+                "Could not verify exchange position after failed TPSL "
+                "update | trade_id=%s",
+                trade.get("id"),
+            )
+            return {
+                "ok": False,
+                "protection_preserved": False,
+                "reason": (
+                    f"{failure_reason}; position_check_failed:"
+                    f"{type(exc).__name__}:{exc}"
+                ),
+            }
+
+        try:
+            orders = self.account.unfilled_strategy_orders()
+            if not isinstance(orders, list):
+                raise ValueError("strategy_order_response_invalid")
+        except Exception as exc:
+            self.positions_reconciled = False
+            log.exception(
+                "Could not verify protection after failed TPSL update | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            return {
+                "ok": False,
+                "protection_preserved": False,
+                "reason": (
+                    f"{failure_reason}; protection_check_failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+
+        active = self._active_trade_strategy_orders(
+            symbol, direction, orders
+        )
+        if len(active) > 1:
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "protection_preserved": False,
+                "reason": "multiple_active_trade_strategy_orders",
+            }
+        requested_matches = [
+            order
+            for order in active
+            if self._strategy_order_matches(
+                order, requested_stop, requested_target, quantity
+            )
+        ]
+        if len(requested_matches) == 1:
+            order = requested_matches[0]
+            self.positions_reconciled = True
+            return {
+                "ok": True,
+                "protection_preserved": True,
+                "recovered_update": True,
+                "stop_confirmed": True,
+                "target_confirmed": True,
+                "actual_stop": order.get("stopLoss"),
+                "actual_target": order.get("takeProfit"),
+                "order_id": order.get("orderId") or order_id,
+                "client_oid": order.get("clientOid") or client_oid,
+                "status": str(order.get("status") or "").lower(),
+            }
+        if len(requested_matches) > 1:
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "protection_preserved": False,
+                "reason": "multiple_matching_requested_protection_orders",
+            }
+
+        old_matches = [
+            order
+            for order in active
+            if self._strategy_order_matches(
+                order, old_stop, old_target, quantity
+            )
+        ]
+        if len(old_matches) == 1:
+            order = old_matches[0]
+            self.positions_reconciled = True
+            return {
+                "ok": False,
+                "protection_preserved": True,
+                "protection_restored": False,
+                "actual_stop": order.get("stopLoss"),
+                "actual_target": order.get("takeProfit"),
+                "order_id": order.get("orderId") or order_id,
+                "client_oid": order.get("clientOid") or client_oid,
+                "reason": failure_reason,
+            }
+        if active:
+            self.positions_reconciled = False
+            return {
+                "ok": False,
+                "protection_preserved": False,
+                "reason": (
+                    f"{failure_reason}; active_protection_unrecognized"
+                ),
+            }
+
+        try:
+            mark_price = self._mark_price(symbol)
+            if mark_price is None:
+                raise ValueError("mark_price_unavailable")
+            if (
+                direction == "LONG" and old_stop >= mark_price
+            ) or (
+                direction == "SHORT" and old_stop <= mark_price
+            ):
+                raise ValueError("existing_stop_invalid_vs_mark_price")
+
+            replacement_client_oid = "tpsl-" + uuid.uuid4().hex[:20]
+            replacement = self.account.place_tpsl_order(
+                symbol,
+                side="sell" if direction == "LONG" else "buy",
+                client_oid=replacement_client_oid,
+                stop=self._precision_price(symbol, old_stop),
+                target=None,
+                pos_side=direction.lower(),
+            )
+            replacement_order_id = self._extract_order_id(replacement)
+            confirmation = self._reconcile_tpsl_order(
+                symbol,
+                replacement_order_id,
+                replacement_client_oid,
+                self._precision_price(symbol, old_stop),
+                None,
+            )
+            if confirmation.get("ok"):
+                self.positions_reconciled = True
+                return {
+                    **confirmation,
+                    "ok": False,
+                    "protection_preserved": True,
+                    "protection_restored": True,
+                    "actual_stop": confirmation.get("actual_stop") or old_stop,
+                    "actual_target": None,
+                    "order_id": confirmation.get("order_id")
+                    or replacement_order_id,
+                    "client_oid": confirmation.get("client_oid")
+                    or replacement_client_oid,
+                    "reason": failure_reason,
+                }
+        except Exception as exc:
+            log.exception(
+                "FAILED TO RESTORE ORIGINAL STOP AFTER TPSL UPDATE ERROR | "
+                "trade_id=%s",
+                trade.get("id"),
+            )
+            failure_reason = (
+                f"{failure_reason}; stop_restore_failed:"
+                f"{type(exc).__name__}:{exc}"
+            )
+
+        self.positions_reconciled = False
+        return {
+            "ok": False,
+            "protection_preserved": False,
+            "reason": failure_reason,
+        }
+
     @staticmethod
     def _extract_order_id(data):
         if not isinstance(data, dict):
@@ -934,6 +1192,59 @@ class ExecutionEngine:
         current_order = candidates[0]
         order_id = str(current_order.get("orderId") or stored_order_id)
         client_oid = str(current_order.get("clientOid") or stored_client_oid)
+        if self.exchange is not None:
+            try:
+                mark_price = self._mark_price(trade["symbol"])
+                if mark_price is None:
+                    raise ValueError("mark_price_unavailable")
+                invalid_stop_side = (
+                    direction == "LONG" and new_stop >= mark_price
+                ) or (
+                    direction == "SHORT" and new_stop <= mark_price
+                )
+                if invalid_stop_side:
+                    result = self._preserve_protection_after_update_failure(
+                        trade,
+                        order_id,
+                        client_oid,
+                        stop,
+                        target,
+                        old_stop,
+                        expected_target,
+                        (
+                            "new_stop_invalid_vs_mark_price:"
+                            f"stop={new_stop}:mark={mark_price}"
+                        ),
+                    )
+                    log.warning(
+                        "TPSL UPDATE SKIPPED; STOP IS NOT ON VALID SIDE OF "
+                        "MARK PRICE | trade_id=%s | direction=%s | "
+                        "new_stop=%s | mark=%s | protection_preserved=%s",
+                        trade.get("id"),
+                        direction,
+                        new_stop,
+                        mark_price,
+                        result.get("protection_preserved"),
+                    )
+                    return result
+            except Exception as exc:
+                result = self._preserve_protection_after_update_failure(
+                    trade,
+                    order_id,
+                    client_oid,
+                    stop,
+                    target,
+                    old_stop,
+                    expected_target,
+                    f"mark_price_check_failed:{type(exc).__name__}:{exc}",
+                )
+                log.exception(
+                    "TPSL UPDATE BLOCKED; MARK PRICE COULD NOT BE "
+                    "VALIDATED | trade_id=%s",
+                    trade.get("id"),
+                )
+                return result
+
         try:
             self.account.modify_tpsl_order(
                 symbol=trade["symbol"],
@@ -947,17 +1258,25 @@ class ExecutionEngine:
                 pos_side=direction.lower(),
             )
         except Exception as exc:
+            failure_reason = (
+                f"protection_update_rejected:{type(exc).__name__}:{exc}"
+            )
             log.exception(
-                "TPSL modification request failed | trade_id=%s | "
-                "order_id=%s",
+                "TPSL modification request failed; verifying requested and "
+                "previous protection | trade_id=%s | order_id=%s",
                 trade.get("id"),
                 order_id or "unknown",
             )
-            self.positions_reconciled = False
-            return {
-                "ok": False,
-                "reason": f"protection_update_rejected:{type(exc).__name__}",
-            }
+            return self._preserve_protection_after_update_failure(
+                trade,
+                order_id,
+                client_oid,
+                stop,
+                target,
+                old_stop,
+                expected_target,
+                failure_reason,
+            )
 
         confirmation = self._reconcile_tpsl_order(
             trade["symbol"],
@@ -967,13 +1286,17 @@ class ExecutionEngine:
             target,
         )
         if not confirmation.get("ok"):
-            self.positions_reconciled = False
-            return {
-                **confirmation,
-                "ok": False,
-                "reason": confirmation.get("reason")
+            return self._preserve_protection_after_update_failure(
+                trade,
+                order_id,
+                client_oid,
+                stop,
+                target,
+                old_stop,
+                expected_target,
+                confirmation.get("reason")
                 or "updated_protection_not_confirmed",
-            }
+            )
 
         return {
             **confirmation,
