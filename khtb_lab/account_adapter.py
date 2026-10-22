@@ -693,10 +693,12 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             raise ValueError("TPSL side must be 'buy' or 'sell'")
 
         stop_value = self._number(stop)
-        target_value = self._number(target)
+        target_value = self._number(target) if target is not None else None
         if stop_value is None or stop_value <= 0:
             raise ValueError("Invalid stop-loss price")
-        if target_value is None or target_value <= 0:
+        if target is not None and (
+            target_value is None or target_value <= 0
+        ):
             raise ValueError("Invalid take-profit price")
 
         body = {
@@ -707,9 +709,15 @@ class BitgetUTAAdapter(PlatformAccountAdapter):
             "side": side,
             "clientOid": str(client_oid),
             "marginMode": self.settings.margin_mode,
-            "takeProfit": str(target),
-            "tpTriggerBy": "mark",
-            "tpOrderType": "market",
+            "takeProfit": (
+                str(target) if target_value is not None else ""
+            ),
+            "tpTriggerBy": (
+                "mark" if target_value is not None else ""
+            ),
+            "tpOrderType": (
+                "market" if target_value is not None else ""
+            ),
             "stopLoss": str(stop),
             "slTriggerBy": "mark",
             "slOrderType": "market",

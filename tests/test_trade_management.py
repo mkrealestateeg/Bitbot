@@ -178,6 +178,34 @@ def test_profit_lock_trigger_reached_but_market_has_crossed_lock_price():
     app.db.close()
 
 
+def test_rejected_lock_update_keeps_confirmed_original_protection_and_gate():
+    app, calls = _app(price=100.34, monotonic_lows=True)
+    frame = _candles(monotonic_lows=True)
+    frame["high"] = frame["high"].clip(upper=100.34)
+    app.market.candles = lambda symbol, timeframe, limit: frame
+    app.execution.update_tpsl_protection = (
+        lambda trade, stop, target: {
+            "ok": False,
+            "protection_preserved": True,
+            "actual_stop": "95",
+            "actual_target": "120",
+            "order_id": "tpsl-1",
+            "client_oid": "tpsl-client",
+            "reason": "new_stop_invalid_vs_mark_price",
+        }
+    )
+
+    assert app._manage_exchange_trades() is True
+
+    trade = app.db.open_trades("DEMO")[0]
+    assert trade["management_stage"] == 1
+    assert trade["stop"] == 95
+    assert trade["protection_order_id"] == "tpsl-1"
+    assert app.execution.positions_reconciled is True
+    assert calls == []
+    app.db.close()
+
+
 def test_tp1_lock_moves_stop_to_one_r_after_an_extra_ten_percent_roe():
     app, calls = _app(price=105.4, monotonic_lows=True)
     frame = _candles(monotonic_lows=True)

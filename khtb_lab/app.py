@@ -553,13 +553,68 @@ class KhtbLab:
                         ),
                     )
                     if not result.get("ok"):
+                        if result.get("protection_preserved"):
+                            preserved_stage = stage
+                            if (
+                                result.get("actual_target") is None
+                                and stage < self.TARGET_REMOVED_STAGE
+                            ):
+                                preserved_stage = (
+                                    self.TARGET_REMOVED_STAGE
+                                )
+                            if not self.db.save_trade_management(
+                                trade["id"],
+                                preserved_stage,
+                                favorable,
+                                stop,
+                                result.get("order_id"),
+                                result.get("client_oid"),
+                            ):
+                                all_ok = False
+                                self.execution.positions_reconciled = False
+                                log.error(
+                                    "Could not persist confirmed existing "
+                                    "protection | trade_id=%s",
+                                    trade["id"],
+                                )
+                                self.notify(
+                                    f"🚨 حماية {trade['symbol']} موجودة على "
+                                    "Bitget، لكن تعذّر حفظ بياناتها محليًا. "
+                                    "أوقفت أوامر AUTO حتى إعادة المصالحة."
+                                )
+                                continue
+                            stage = preserved_stage
+                            log.warning(
+                                "REQUESTED TPSL CHANGE NOT APPLIED; "
+                                "EXISTING PROTECTION CONFIRMED | "
+                                "trade_id=%s | symbol=%s | stop=%s | "
+                                "target=%s | reason=%s",
+                                trade["id"],
+                                trade["symbol"],
+                                stop,
+                                result.get("actual_target"),
+                                result.get("reason"),
+                            )
+                            if result.get("protection_restored"):
+                                self.notify(
+                                    f"🛡 تعذّر تعديل وقف {trade['symbol']}؛ "
+                                    "أُعيد تأكيد وقف الخسارة السابق على "
+                                    f"Bitget عند {stop:.8g}. قد لا يكون "
+                                    "هدف TP نشطًا؛ تحقّق منه يدويًا."
+                                )
+                            else:
+                                self.notify(
+                                    f"⚠️ لم يتم نقل وقف {trade['symbol']} "
+                                    f"إلى {stop_now:.8g}. تأكد بقاء الوقف "
+                                    f"السابق عند {stop:.8g} نشطًا على "
+                                    "Bitget؛ سيُعاد تقييم النقل لاحقًا."
+                                )
+                            continue
+
                         all_ok = False
                         self.execution.positions_reconciled = False
                         if not self.db.save_trade_management(
-                            trade["id"],
-                            stage,
-                            favorable,
-                            stop,
+                            trade["id"], stage, favorable, stop
                         ):
                             log.error(
                                 "Could not persist pending protection "
@@ -574,9 +629,9 @@ class KhtbLab:
                             result.get("reason"),
                         )
                         self.notify(
-                            f"🚨 تعذّر تأكيد تعديل حماية "
-                            f"{trade['symbol']} على Bitget. بقيت الحماية "
-                            "السابقة كما هي؛ أوقفت أوامر AUTO الجديدة "
+                            f"🚨 تعذّر تأكيد وقف الحماية الحالي أو البديل "
+                            f"لصفقة {trade['symbol']} على Bitget. تحقّق من "
+                            "الصفقة وأوامر SL فورًا؛ أوقفت أوامر AUTO "
                             "حتى نجاح المصالحة."
                         )
                         continue
@@ -601,14 +656,18 @@ class KhtbLab:
                         )
                     elif stop_changed:
                         log.info(
-                            "STRUCTURAL STOP ADVANCED | trade_id=%s | "
-                            "symbol=%s | old_stop=%s | new_stop=%s | "
+                            "PROTECTION STOP UPDATE CONFIRMED | trade_id=%s | "
+                            "symbol=%s | old_stop=%s | confirmed_new_stop=%s | "
                             "virtual_tp2=%s",
                             trade["id"],
                             trade["symbol"],
                             trade["stop"],
                             stop,
                             trade["target"],
+                        )
+                        self.notify(
+                            f"✅ تم تأكيد وقف حماية {trade['symbol']} على "
+                            f"Bitget عند {stop:.8g}."
                         )
 
                 if (
