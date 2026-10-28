@@ -594,9 +594,35 @@ def test_short_mark_price_race_keeps_old_confirmed_stop_after_rejection():
     assert calls == [("modify-tpsl", 99.66, 90)]
 
 
-def test_missing_old_protection_is_replaced_with_confirmed_stop_only_order():
+def test_missing_old_protection_is_replaced_with_original_stop_and_target():
     engine, calls, trade = _short_protection_update_engine(
         ["99.65", "99.65"]
+    )
+    engine.account.modify_error = RuntimeError(
+        "Bitget HTTP 400: 25592 stop-loss trigger price must be greater "
+        "than the mark price"
+    )
+    engine.account.remove_order_on_modify_error = True
+
+    result = engine.update_tpsl_protection(trade, 99.66, 90)
+
+    assert result["ok"] is False
+    assert result["protection_preserved"] is True
+    assert result["protection_restored"] is True
+    assert float(result["actual_stop"]) == 105
+    assert float(result["actual_target"]) == 90
+    assert float(engine.account.tpsl_order["stopLoss"]) == 105
+    assert float(engine.account.tpsl_order["takeProfit"]) == 90
+    assert engine.positions_reconciled is True
+    assert calls == [
+        ("modify-tpsl", 99.66, 90),
+        ("tpsl", "105.00", "90.00"),
+    ]
+
+
+def test_missing_old_protection_restores_stop_only_if_original_target_crossed():
+    engine, calls, trade = _short_protection_update_engine(
+        ["99.65", "89"]
     )
     engine.account.modify_error = RuntimeError(
         "Bitget HTTP 400: 25592 stop-loss trigger price must be greater "
