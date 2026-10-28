@@ -826,13 +826,30 @@ class ExecutionEngine:
             ):
                 raise ValueError("existing_stop_invalid_vs_mark_price")
 
+            recovery_target = old_target
+            if recovery_target is not None:
+                recovery_target = self._number_or_none(recovery_target)
+                target_already_crossed = (
+                    direction == "LONG"
+                    and recovery_target <= mark_price
+                ) or (
+                    direction == "SHORT"
+                    and recovery_target >= mark_price
+                )
+                if target_already_crossed:
+                    recovery_target = None
+
             replacement_client_oid = "tpsl-" + uuid.uuid4().hex[:20]
             replacement = self.account.place_tpsl_order(
                 symbol,
                 side="sell" if direction == "LONG" else "buy",
                 client_oid=replacement_client_oid,
                 stop=self._precision_price(symbol, old_stop),
-                target=None,
+                target=(
+                    self._precision_price(symbol, recovery_target)
+                    if recovery_target is not None
+                    else None
+                ),
                 pos_side=direction.lower(),
             )
             replacement_order_id = self._extract_order_id(replacement)
@@ -841,7 +858,11 @@ class ExecutionEngine:
                 replacement_order_id,
                 replacement_client_oid,
                 self._precision_price(symbol, old_stop),
-                None,
+                (
+                    self._precision_price(symbol, recovery_target)
+                    if recovery_target is not None
+                    else None
+                ),
             )
             if confirmation.get("ok"):
                 self.positions_reconciled = True
@@ -851,7 +872,7 @@ class ExecutionEngine:
                     "protection_preserved": True,
                     "protection_restored": True,
                     "actual_stop": confirmation.get("actual_stop") or old_stop,
-                    "actual_target": None,
+                    "actual_target": confirmation.get("actual_target"),
                     "order_id": confirmation.get("order_id")
                     or replacement_order_id,
                     "client_oid": confirmation.get("client_oid")
@@ -860,12 +881,13 @@ class ExecutionEngine:
                 }
         except Exception as exc:
             log.exception(
-                "FAILED TO RESTORE ORIGINAL STOP AFTER TPSL UPDATE ERROR | "
+                "FAILED TO RESTORE ORIGINAL PROTECTION AFTER TPSL UPDATE "
+                "ERROR | "
                 "trade_id=%s",
                 trade.get("id"),
             )
             failure_reason = (
-                f"{failure_reason}; stop_restore_failed:"
+                f"{failure_reason}; protection_restore_failed:"
                 f"{type(exc).__name__}:{exc}"
             )
 
